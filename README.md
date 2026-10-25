@@ -83,9 +83,13 @@ uv run python src/convert_hf_safetensors_to_gguf.py black-forest-labs/FLUX.2-kle
 - `src/ggml/ShardingRuntime.hpp`, `MetaDevice.hpp` — plan how tensors are split across multiple devices.
 - `test/` — the Python cross-check test suite: each test drives a small C++ CLI (`test/utils/`) and compares its output against the Python reference implementation.
 
+## Porting a Pipeline from Python
+
+A port mirrors the Python implementation module by module and replaces the Python/PyTorch runtime with this project's C++ runtime in a few systematic ways. [SKILL.md](.agents/skills/port/SKILL.md) is the complete guide — tensor operators, modules (including the weight splitting that fused projections require), pipelines, and sharding support.
+
 ## Testing
 
-The test suite is the fidelity check: each test runs the C++ implementation and the Python reference with identical inputs (random weights, real model shapes) and compares the outputs.
+The test suite is the fidelity check: each test runs the C++ implementation and the Python reference with identical inputs (random weights, real model shapes) and compares the outputs. Component tests match exactly (`torch.allclose`, `rtol=1e-4`); the end-to-end pipeline test runs with the shipped quantization config and allows a max pixel difference of 2.5/255.
 
 - One ctest entry per Python test method. The Python reference runs in a uv-managed venv (created automatically at build time) against pinned diffusers/transformers commits — see `test/requirements.txt`.
 - Tests use tiny random models; GGUF files are never involved.
