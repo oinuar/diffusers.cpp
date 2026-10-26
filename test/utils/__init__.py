@@ -229,28 +229,36 @@ def dequantize_to_float32(raw, qtype, shape):
 
 
 class TestCase(unittest.TestCase):
-    def cli(self, *args: str) -> list:
-        command = [
-            *args,
-            '--runner-n_devices', str(self.n_devices()),
-            '--runner-use_gpu', str(self.use_gpu()).lower(),
-            *sum((["--runner-tensor_split", str(x)] for x in self.tensor_splits()), [])
-        ]
+    def run(self, result=None):
+        result = super().run(result)
 
-        command_w_args = " ".join([self.cli_bin()] + list(map(lambda x: x if x.startswith("--") else f'"{x}"', command)))
+        for collection in (result.failures, result.errors):
+            for i, (test, traceback) in enumerate(collection):
+                if test is self:
+                    path = self.repro_script_path()
+                    
+                    if self.write_repro_script():
+                        collection[i] = (
+                            test,
+                            traceback
+                            + f"\nRun this command to reproduce the failure:\n"
+                            f"    uv run {path}\n",
+                        )
 
-        result = subprocess.run([self.cli_bin()] + command, capture_output=True, text=True, timeout=30)
+        return result
 
-        # If command failed, write a reproduction script.
-        if result.returncode != 0:
-            os.makedirs(os.path.dirname(self.repro_script_path()), exist_ok=True)
+    def write_repro_script(self):
+        if not self._cli_command:
+            return False
 
-            with open(self.repro_script_path(), 'w') as f:
-                f.write(f"""
+        os.makedirs(os.path.dirname(self.repro_script_path()), exist_ok=True)
+
+        with open(self.repro_script_path(), 'w') as f:
+            f.write(f"""
 import os, sys, subprocess
 
 # Never edit this line! We must keep test parameters as-is.
-command = [{repr(self.cli_bin())}] + {repr(command)}
+command = [{repr(self.cli_bin())}] + {repr(self._cli_command)}
 
 # Add gdb by editing this line while keeping test parameters exactly same. For example:
 #   command = ['gdb', '--args'] + command
@@ -264,7 +272,23 @@ result = subprocess.run(
 
 sys.exit(result.returncode)
 """)
-            raise RuntimeError(f'{self.cli_bin()} failed (rc={result.returncode}):\n{result.stderr}\nRun this command to reproduce the exact failure:\n    uv run {self.repro_script_path()}')
+        return True
+
+    def cli(self, *args: str) -> list:
+        self._cli_command = [
+            *args,
+            '--runner-n_devices', str(self.n_devices()),
+            '--runner-use_gpu', str(self.use_gpu()).lower(),
+            *sum((["--runner-tensor_split", str(x)] for x in self.tensor_splits()), [])
+        ]
+
+        command_w_args = " ".join([self.cli_bin()] + list(map(lambda x: x if x.startswith("--") else f'"{x}"', self._cli_command)))
+
+        result = subprocess.run([self.cli_bin()] + self._cli_command, capture_output=True, text=True, timeout=30)
+
+        # If command failed, write a reproduction script.
+        if result.returncode != 0:
+            raise RuntimeError(f'{self.cli_bin()} failed (rc={result.returncode}):\n{result.stderr}')
 
         outputs = []
         for line in result.stdout.strip().split('\n'):

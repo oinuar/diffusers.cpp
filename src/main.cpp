@@ -46,8 +46,9 @@ int main(int argc, char** argv) {
 
     Flux2KleinPipeline::GenerationOptions options;
     options.prompt = "a lovely cat";
-    options.width = 256;
-    options.height = 256;
+    options.decode_tile_size = 64;
+    options.width = 512;
+    options.height = 512;
 
     auto computation = pipeline(context, context, context, std::move(options));
 

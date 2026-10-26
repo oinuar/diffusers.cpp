@@ -62,7 +62,10 @@ public:
     // is the sum of the packed token counts of all images. Returns
     // std::nullopt when there are no images. tile_size is the VAE encode
     // tile size in pixels; 0 disables tiled encoding.
-    std::optional<Tensor> encode_images(Scope scope, const std::vector<Image>& images, int batch, int tile_size = 0);
+    //
+    // Each reference image is a state cell (its pixels), so the tiled
+    // encode can run every tile in its own graph scope.
+    std::optional<Computation<Tensor>> encode_images(Computation<void> computation, const std::vector<Image>& images, int batch, int tile_size = 0);
 
     // Encodes the prompt into text embeddings (B, L, 3 * hidden_dim).
     Tensor encode_prompt(Scope scope, int batch, const std::string& prompt, size_t max_sequence_length);
@@ -84,7 +87,7 @@ public:
 
     // Decodes packed latents into pixels (B, 3, H, W). tile_size is the
     // VAE decode tile size in pixels; 0 disables tiled decoding.
-    Tensor decode(Scope scope, const Tensor& latents, int packed_h, int packed_w, int tile_size = 0);
+    Computation<Tensor> decode(Computation<Tensor> latents, int packed_h, int packed_w, int tile_size = 0);
 
     int64_t vae_scale_factor() const {
         return vae_.scale_factor();

@@ -16,12 +16,6 @@
 #include <chrono>
 #include <optional>
 
-static Tensor repeat_batch(const Tensor& t, int batch) {
-    if (batch <= 1) return t;
-    auto shape = t.shape();
-    shape[0] = batch;
-    return t.repeat(shape);
-}
 
 // 4D txt_ids: (B, L, 4) -> [0, 0, 0, l]
 static Tensor prepare_txt_ids(Scope scope, int batch, int64_t seq_len) {
@@ -193,57 +187,48 @@ std::vector<Image> Flux2KleinPipeline::to_images(const Tensor::Shape& shape, std
     return std::move(images);
 }
 
-static Tensor image_to_tensor(Scope scope, const Image& img) {
+// HWC uint8 -> CHW float32 in [-1, 1].
+//
+// Matches VaeImageProcessor.preprocess(): (image / 255.0) * 2.0 - 1.0,
+// mapping [0, 255] to [-1, 1].
+static std::vector<float> image_to_tensor_data(const Image& img) {
     const size_t width = img.width();
     const size_t height = img.height();
     const size_t channels = img.channels();
 
-    if (channels != 3) {
+    if (channels != 3)
         throw std::invalid_argument(
-            "image_to_tensor(): expected RGB image with 3 channels, got " +
+            "image_to_tensor_data(): expected RGB image with 3 channels, got " +
             std::to_string(channels));
-    }
 
     const auto& pixels = img.pixels();
 
     const size_t expected_size = width * height * channels;
-    if (pixels.size() != expected_size) {
+    if (pixels.size() != expected_size)
         throw std::invalid_argument(
-            "image_to_tensor(): pixel buffer size does not match image dimensions");
+            "image_to_tensor_data(): pixel buffer size does not match image dimensions");
+
+    const size_t plane = width * height;
+
+    std::vector<float> data(3 * plane);
+
+    for (size_t y = 0; y < height; ++y) {
+        for (size_t x = 0; x < width; ++x) {
+            const size_t src = (y * width + x) * 3;
+            const size_t dst = y * width + x;
+
+            data[0 * plane + dst] =
+                2.0f * (static_cast<float>(pixels[src + 0]) / 255.0f) - 1.0f;
+
+            data[1 * plane + dst] =
+                2.0f * (static_cast<float>(pixels[src + 1]) / 255.0f) - 1.0f;
+
+            data[2 * plane + dst] =
+                2.0f * (static_cast<float>(pixels[src + 2]) / 255.0f) - 1.0f;
+        }
     }
 
-    return scope.context().create<float>(
-        {1, 3, static_cast<int64_t>(height), static_cast<int64_t>(width)},
-        [pixels, width, height](std::mt19937&) {
-            const size_t plane = width * height;
-
-            std::vector<float> data(3 * plane);
-
-            for (size_t y = 0; y < height; ++y) {
-                for (size_t x = 0; x < width; ++x) {
-                    const size_t src =
-                        (y * width + x) * 3;
-
-                    const size_t dst =
-                        y * width + x;
-
-                    // HWC uint8 -> CHW float32.
-                    //
-                    // Matches VaeImageProcessor.preprocess():
-                    // (image / 255.0) * 2.0 - 1.0, mapping [0, 255] to [-1, 1].
-                    data[0 * plane + dst] =
-                        2.0f * (static_cast<float>(pixels[src + 0]) / 255.0f) - 1.0f;
-
-                    data[1 * plane + dst] =
-                        2.0f * (static_cast<float>(pixels[src + 1]) / 255.0f) - 1.0f;
-
-                    data[2 * plane + dst] =
-                        2.0f * (static_cast<float>(pixels[src + 2]) / 255.0f) - 1.0f;
-                }
-            }
-
-            return data;
-        });
+    return data;
 }
 
 Image Flux2KleinPipeline::preprocess_reference_image(const Image& image, int multiple, double target_area) {
@@ -322,10 +307,7 @@ Computation<Tensor> Flux2KleinPipeline::operator()(
         img = preprocess_reference_image(img, vae_multiple);
 
     // 2. Encode images to latents.
-    auto image_latents = computation
-        .scope([&](Scope scope) -> std::optional<Tensor> {
-            return encode_images(scope, options.images, batch, options.encode_tile_size);
-        });
+    auto image_latents = encode_images(computation, options.images, batch, options.encode_tile_size);
 
     // 3. Encode the prompt into text embeddings.
     auto prompt_embeds = computation
@@ -373,66 +355,87 @@ Computation<Tensor> Flux2KleinPipeline::operator()(
             *prompt_embeds,
             img_ids,
             txt_ids,
-            *image_latents,
+            image_latents ? std::make_optional(**image_latents) : std::nullopt,
             image_latent_ids,
             timestep,
             dt);
     });
 
     // 7. Decode latents to pixels.
-    auto decoded = latents.scope([&](Scope scope, Tensor latents) -> Tensor {
-        return decode(scope, latents, packed_h, packed_w, options.decode_tile_size);
-    });
+    auto decoded = decode(latents, packed_h, packed_w, options.decode_tile_size);
 
     return decoded;
 }
 
-std::optional<Tensor> Flux2KleinPipeline::encode_images(Scope scope, const std::vector<Image>& images, int batch, int tile_size) {
+std::optional<Computation<Tensor>> Flux2KleinPipeline::encode_images(Computation<void> computation, const std::vector<Image>& images, int batch, int tile_size) {
     if (images.empty())
         return std::nullopt;
 
     const int vae_multiple = vae_.scale_factor() * 2;
 
-    std::vector<Tensor> packed_imgs;
+    std::vector<Computation<Tensor>> packed_imgs;
     packed_imgs.reserve(images.size());
 
-    // TODO: maybe encode only one image in this graph? it would better match decode then
     for (auto& img : images) {
-        auto img_tensor = image_to_tensor(scope, img);
+        // The pixels of each reference image are a state cell, so the
+        // tiled encode can run every tile in its own graph scope.
+        auto img_tensor = computation.state(
+            {1, 3, static_cast<int64_t>(img.height()), static_cast<int64_t>(img.width())},
+            [img](std::mt19937&) {
+                return image_to_tensor_data(img);
+            });
+
         // (B, C, H / scale, W / scale)
         auto mode = (tile_size > 0)
-            ? vae_.encode_tiled(scope, img_tensor, tile_size, tile_size)
-            : vae_.encode(scope, img_tensor).mode();
+            ? vae_.encode_tiled(img_tensor, tile_size, tile_size)
+            : img_tensor.scope([this](Scope scope, Tensor sample) -> Tensor {
+                return this->vae_.encode(scope, sample).mode();
+            });
 
         auto packed_h = img.height() / vae_multiple;
         auto packed_w = img.width() / vae_multiple;
 
         // 1. Patchify: (B, C, H, W) -> (B, 4C, H/2, W/2)
-        auto patched_mode = patchify_latents(mode, vae_.latent_channels(), packed_h, packed_w);
+        // 2. Apply BN normalization to the patchified latents.
+        // 3. Pack: (B, 4C, H/2, W/2) -> (B, H/2 * W/2, 4C)
+        auto packed = mode.scope([this, packed_h, packed_w](Scope scope, Tensor mode) -> Tensor {
+            auto patched = patchify_latents(mode, vae_.latent_channels(), packed_h, packed_w);
 
-        // 2. Apply BN normalization to patchified latents
-        auto bn_mean = (*vae_.bn()->running_mean())->reshape({1, -1, 1, 1});
-        auto bn_std = sqrt((*vae_.bn()->running_var())->reshape({1, -1, 1, 1}) + vae_.batch_norm_eps());
-        patched_mode = (patched_mode - bn_mean) / bn_std; // Apply to (B, 4C, H/2, W/2)
+            auto bn_mean = (*vae_.bn()->running_mean())->reshape({1, -1, 1, 1});
+            auto bn_std = sqrt((*vae_.bn()->running_var())->reshape({1, -1, 1, 1}) + vae_.batch_norm_eps());
+            patched = (patched - bn_mean) / bn_std;
 
-        // 3. Pack latents: (B, 4C, H/2, W/2) -> (B, H/2 * W/2, 4C)
-        auto packed = pack_latents(patched_mode);
+            return pack_latents(patched);
+        });
 
-        packed_imgs.push_back(packed);
+        packed_imgs.push_back(std::move(packed));
     }
 
-    // Concatenate reference images along the token dimension:
+    // Concatenate the reference images along the token dimension:
     //
     // (1, N1, 4C)
     // (1, N2, 4C)
     //       ↓
     // (1, N1 + N2, 4C)
-    auto image_latents = Tensor::cat(packed_imgs, /*axis=*/1);
+    //
+    // and repeat for num_images_per_prompt.
+    return computation.scope([&, batch](Scope scope) -> Tensor {
+        std::vector<Tensor> packed;
+        packed.reserve(packed_imgs.size());
 
-    // Repeat reference latents for num_images_per_prompt.
-    image_latents = repeat_batch(image_latents, batch);
+        for (auto& p : packed_imgs)
+            packed.push_back(*p);
 
-    return image_latents;
+        auto image_latents = Tensor::cat(packed, /*axis=*/1);
+
+        if (batch > 1) {
+            auto shape = image_latents.shape();
+            shape[0] = batch;
+            image_latents = image_latents.repeat(shape);
+        }
+
+        return image_latents;
+    });
 }
 
 Tensor Flux2KleinPipeline::encode_prompt(Scope scope, int batch, const std::string& prompt, size_t max_sequence_length) {
@@ -536,24 +539,31 @@ Tensor Flux2KleinPipeline::denoise(
     return scheduler_.integrate(scope, noise_pred, latents, dt);
 }
 
-Tensor Flux2KleinPipeline::decode(Scope scope, const Tensor& latents, int packed_h, int packed_w, int tile_size) {
-    // 1. Unpack to patch grid (B, 4C, ph, pw)
-    auto z_packed = unpack_latents(latents, packed_h, packed_w);
+Computation<Tensor> Flux2KleinPipeline::decode(Computation<Tensor> latents, int packed_h, int packed_w, int tile_size) {
+    auto z = latents.scope([&](Scope scope, Tensor latents) -> Tensor {
+        // 1. Unpack to patch grid (B, 4C, ph, pw)
+        auto z_packed = unpack_latents(latents, packed_h, packed_w);
 
-    // 2. BN Unnormalize before VAE decode (Broadcasts over the 4C channels)
-    auto bn_mean = (*vae_.bn()->running_mean())->reshape({1, -1, 1, 1});
-    auto bn_std = sqrt((*vae_.bn()->running_var())->reshape({1, -1, 1, 1}) + vae_.batch_norm_eps());
-    z_packed = z_packed * bn_std + bn_mean;
+        // 2. BN-unnormalize
+        auto bn_mean = (*vae_.bn()->running_mean())->reshape({1, -1, 1, 1});
+        auto bn_std = sqrt((*vae_.bn()->running_var())->reshape({1, -1, 1, 1}) + vae_.batch_norm_eps());
+        z_packed = z_packed * bn_std + bn_mean;
 
-    // 3. Unpatchify to spatial latents (B, C, 2ph, 2pw)
-    auto z = unpatchify_latents(z_packed, vae_.latent_channels(), packed_h, packed_w);
+        // 3. unpatchify to spatial latents (B, C, 2ph, 2pw)
+        auto z = unpatchify_latents(z_packed, vae_.latent_channels(), packed_h, packed_w);
 
-    // 4. VAE decode
-    auto decoded = (tile_size > 0)
-        ? vae_.decode_tiled(scope, z, tile_size, tile_size)    // (B, 3, H, W)
-        : vae_.decode(scope, z);                               // (B, 3, H, W)
+        // 4. VAE decode (non-tiled).
+        if (tile_size == 0)
+            return vae_.decode(scope, z);
 
-    return decoded;
+        return z;
+    });
+
+    // 2. VAE decode (tiled).
+    if (tile_size > 0)
+        return vae_.decode_tiled(z, tile_size, tile_size);   // (B, 3, H, W)
+
+    return z;
 }
 
 Flux2KleinPipeline Flux2KleinPipeline::from_pretrained(Context& vae_context, Context& text_encoder_context, Context& transformer_context, const std::filesystem::path& path) {

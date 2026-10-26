@@ -555,16 +555,12 @@ public:
                 for (auto& image : images)
                     image = Flux2KleinPipeline::preprocess_reference_image(image, pipeline.vae_scale_factor() * 2);
 
-                auto result = computation.scope([&](Scope scope) -> Tensor {
-                    auto image_latents = pipeline.encode_images(scope, images, batch, tile_size);
+                auto image_latents = pipeline.encode_images(computation, images, batch, tile_size);
 
-                    if (!image_latents)
-                        throw std::runtime_error("Flux2KleinPipeline_vae_encode: expected at least one image");
+                if (!image_latents)
+                    throw std::runtime_error("Flux2KleinPipeline_vae_encode: expected at least one image");
 
-                    return *image_latents;
-                });
-
-                return Computation<Tensor>::all(result);
+                return Computation<Tensor>::all(*image_latents);
             }
 
             if (args_.get(0) == "Flux2KleinPipeline_text_encoder") {
@@ -621,9 +617,7 @@ public:
                 auto latents = args_.get_one<Tensor>("--latents", {computation.desc()->context()});
                 auto tile_size = args_.get_optional<int>("--decode_tile_size").value_or(0);
 
-                auto result = computation.scope([&](Scope scope) -> Tensor {
-                    return pipeline.decode(scope, latents, packed_h, packed_w, tile_size);
-                });
+                auto result = pipeline.decode(Computation<Tensor>(latents, computation.desc()), packed_h, packed_w, tile_size);
 
                 return Computation<Tensor>::all(result);
             }

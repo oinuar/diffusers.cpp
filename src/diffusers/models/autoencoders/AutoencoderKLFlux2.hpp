@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nn/Module.hpp"
+#include "ggml/Computation.hpp"
 #include "diffusers/models/autoencoders/vae/DiagonalGaussianDistribution.hpp"
 #include <filesystem>
 
@@ -47,13 +48,21 @@ public:
     // This bounds the live memory of the full-resolution VAE activations
     // to the tile size regardless of the image size.
     //
+    // The tile grid is split into classes of equal sized tiles (the
+    // interior tiles and the clipped border row and column tiles). Each
+    // class runs in its own repeated graph scope: a single graph (the
+    // VAE pass on one class tile) is re-executed once per class tile,
+    // so the VAE graph never holds more than one tile per class at a
+    // time: the tile count is not bounded by the context capacity. The
+    // border tiles are clipped exactly like diffusers'.
+    //
     // tile_h/tile_w are the tile sizes in pixels (they must be divisible
     // by the VAE's scale factor).
     //
-    Tensor decode_tiled(Scope& scope, Tensor z, int64_t tile_h, int64_t tile_w);
+    Computation<Tensor> decode_tiled(Computation<Tensor> z, int64_t tile_h, int64_t tile_w);
 
     // Returns the blended latent mode (B, latent_channels, H / scale, W / scale).
-    Tensor encode_tiled(Scope& scope, Tensor sample, int64_t tile_h, int64_t tile_w);
+    Computation<Tensor> encode_tiled(Computation<Tensor> sample, int64_t tile_h, int64_t tile_w);
 
     Tensor forward(Scope scope, Tensor sample, bool sample_posterior = false);
     

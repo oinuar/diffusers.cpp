@@ -3,8 +3,9 @@
 #include "ggml/Context.hpp"
 #include "ggml/Scope.hpp"
 #include "ggml/Runtime.hpp"
-#include <set>
+#include <deque>
 #include <memory>
+#include <set>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -148,7 +149,11 @@ struct ComputationValue<Tensor> {
 struct ComputationDescription {
     std::set<Context*> pinned;        // provided from outside (pinned)
     std::optional<Context> state;     // created on demand
-    std::vector<ComputationScope> scopes;
+    // A deque, not a vector: push_back must not invalidate the references
+    // to scope elements that Computation::scope() / fold() hold across the
+    // user body (the body nests more scopes), nor the Context addresses
+    // captured in the Scope frames.
+    std::deque<ComputationScope> scopes;
 
     Context& context() {
         if (!state)

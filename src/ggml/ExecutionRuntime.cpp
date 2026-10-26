@@ -7,7 +7,6 @@
 #include "ProgressBar.hpp"
 #include <chrono>
 #include <thread>
-#include <iostream>
 
 ExecutionRuntime ExecutionRuntime::Default;
 
@@ -309,7 +308,7 @@ void ExecutionRuntime::copy(const Tensor& src, const Tensor& dst) const {
     ggml_backend_tensor_get(*src, data.data(), 0, nbytes);
     ggml_backend_tensor_set(*dst, data.data(), 0, nbytes);
 
-    std::cerr << "[copy] " << src.name() << " -> " << dst.name() << std::endl;
+    // std::cerr << "[copy] " << src.name() << " -> " << dst.name() << std::endl;
 }
 
 // -------------------------------------------------------------------------

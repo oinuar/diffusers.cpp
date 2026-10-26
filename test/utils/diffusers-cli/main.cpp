@@ -279,15 +279,18 @@ public:
             model.accept(visitor);
             visitor.rethrow();
 
-            auto result = computation.scope([&](Scope scope) -> Tensor {
-                if (args_.get(0) == "AutoencoderKLFlux2_encode_tiled")
-                    return model.encode_tiled(scope, sample, *tile_size, *tile_size);
+            Computation<Tensor> result;
 
-                if (args_.get(0) == "AutoencoderKLFlux2_decode_tiled")
-                    return model.decode_tiled(scope, sample, *tile_size, *tile_size);
+            if (args_.get(0) == "AutoencoderKLFlux2_encode_tiled")
+                result = model.encode_tiled(Computation<Tensor>(sample, computation.desc()), *tile_size, *tile_size);
 
-                return model.forward(scope, sample, sample_posterior);
-            });
+            else if (args_.get(0) == "AutoencoderKLFlux2_decode_tiled")
+                result = model.decode_tiled(Computation<Tensor>(sample, computation.desc()), *tile_size, *tile_size);
+
+            else
+                result = computation.scope([&](Scope scope) -> Tensor {
+                    return model.forward(scope, sample, sample_posterior);
+                });
 
             return Computation<Tensor>::all(result);
         }
