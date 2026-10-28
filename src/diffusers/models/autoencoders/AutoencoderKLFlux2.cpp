@@ -96,11 +96,19 @@ AutoencoderKLFlux2::AutoencoderKLFlux2(
 }
 
 Tensor AutoencoderKLFlux2::forward(Scope scope, Tensor sample, bool sample_posterior) {
-    auto posterior = encode(scope, sample);
+    auto x = sample;
+    auto posterior = encode(scope, x);
 
-    auto z = sample_posterior ? posterior.sample(scope) : posterior.mode();
+    Tensor z;
 
-    return decode(scope, z);
+    if (sample_posterior)
+        z = posterior.sample(scope);
+    else
+        z = posterior.mode();
+    
+    auto dec = decode(scope, z);
+
+    return dec;
 }
 
 DiagonalGaussianDistribution AutoencoderKLFlux2::encode(Scope& scope, Tensor x) {
@@ -114,7 +122,9 @@ DiagonalGaussianDistribution AutoencoderKLFlux2::encode(Scope& scope, Tensor x) 
         enc = quant_conv->forward(scope, enc);
     }
 
-    return DiagonalGaussianDistribution(scope, enc);
+    auto posterior = DiagonalGaussianDistribution(scope, enc);
+
+    return posterior;
 }
 
 Tensor AutoencoderKLFlux2::decode(Scope& scope, Tensor z) {
@@ -126,30 +136,28 @@ Tensor AutoencoderKLFlux2::decode(Scope& scope, Tensor z) {
 
     auto decoder = std::static_pointer_cast<Decoder>(modules["decoder"]);
 
-    return decoder->forward(scope, z);
+    auto dec = decoder->forward(scope, z);
+
+    return dec;
 }
 
-// Blend the first `extent` of b's `axis` (2 = height, 3 = width) with
-// the last `extent` of a's `axis` with a linear ramp (diffusers'
-// blend_v for axis 2, blend_h for axis 3):
 //
-//   b[:, :, x, :] = a[:, :, -extent + x, :] * (1 - w[x])
-//                  + b[:, :, x, :]           * w[x],   w[x] = x / extent
+// Blend the first `extent` columns of b with the last `extent` columns of
+// a with a linear ramp (diffusers' blend_h):
 //
-// The neighbors agree on the size of every dimension but `axis` (they
-// share a grid row or column), so the ramp broadcasts over the blended
-// region.
-static Tensor blend(Scope& scope, const Tensor& a, const Tensor& b, int64_t extent, int64_t axis) {
-    extent = std::min({a.shape()[axis], b.shape()[axis], extent});
+//   b[:, :, :, x] = a[:, :, :, -extent + x] * (1 - w[x])
+//                 + b[:, :, :, x]           * w[x]
+//
+// where w[x] = x / extent, the diffusers' ramp.
+static Tensor blend_h(Scope& scope, const Tensor& a, const Tensor& b, int64_t extent) {
+    extent = std::min({a.shape()[3], b.shape()[3], extent});
 
     if (extent <= 0)
         return b;
 
-    Tensor::Shape w_shape{1, 1, 1, 1};
-    w_shape[axis] = extent;
-
+    // w[x] = x / extent (diffusers: (1 - x / blend_extent), x / blend_extent).
     auto w = Scope::context().create<float>(
-        w_shape,
+        {1, 1, 1, extent},
         [extent](std::mt19937&) {
             std::vector<float> data(extent);
 
@@ -159,19 +167,80 @@ static Tensor blend(Scope& scope, const Tensor& a, const Tensor& b, int64_t exte
             return data;
         });
 
-    // A range slice on `axis`, all the other dimensions as-is.
-    auto axis_range = [axis](std::optional<int64_t> start, std::optional<int64_t> stop) {
-        std::vector<Tensor::Slice> s(4, Tensor::Slice::all());
-        s[axis] = Tensor::Slice::range(start, stop);
-        return s;
-    };
+    auto a_tail = a[{
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::range(a.shape()[3] - extent, std::nullopt)
+    }];
 
-    auto head = a[axis_range(a.shape()[axis] - extent, std::nullopt)] * (1.0f - w) + b[axis_range(0, extent)] * w;
+    auto b_head = b[{
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::range(0, extent)
+    }];
 
-    if (extent >= b.shape()[axis])
+    auto head = a_tail * (1.0f - w) + b_head * w;
+
+    if (extent >= b.shape()[3])
         return head;
 
-    return Tensor::cat({head, b[axis_range(extent, std::nullopt)]}, axis - 4);
+    auto b_rest = b[{
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::range(extent, std::nullopt)
+    }];
+
+    return Tensor::cat({head, b_rest}, -1);
+}
+
+// The blend_h counterpart along the height axis (diffusers' blend_v).
+static Tensor blend_v(Scope& scope, const Tensor& a, const Tensor& b, int64_t extent) {
+    extent = std::min({a.shape()[2], b.shape()[2], extent});
+
+    if (extent <= 0)
+        return b;
+
+    auto w = Scope::context().create<float>(
+        {1, 1, extent, 1},
+        [extent](std::mt19937&) {
+            std::vector<float> data(extent);
+
+            for (int64_t y = 0; y < extent; ++y)
+                data[y] = static_cast<float>(y) / static_cast<float>(extent);
+
+            return data;
+        });
+
+    auto a_tail = a[{
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::range(a.shape()[2] - extent, std::nullopt),
+        Tensor::Slice::all()
+    }];
+
+    auto b_head = b[{
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::range(0, extent),
+        Tensor::Slice::all()
+    }];
+
+    auto head = a_tail * (1.0f - w) + b_head * w;
+
+    if (extent >= b.shape()[2])
+        return head;
+
+    auto b_rest = b[{
+        Tensor::Slice::all(),
+        Tensor::Slice::all(),
+        Tensor::Slice::range(extent, std::nullopt),
+        Tensor::Slice::all()
+    }];
+
+    return Tensor::cat({head, b_rest}, -2);
 }
 
 //
@@ -179,40 +248,33 @@ static Tensor blend(Scope& scope, const Tensor& a, const Tensor& b, int64_t exte
 //
 // - The input (B, C, H, W) is tiled with a 3/4 stride, so adjacent tiles
 //   overlap by a quarter of the tile size (clipped at the input borders).
-// - The equal-sized tiles form the rectangles of the grid (the tile
-//   height depends only on the row, the width only on the column, and
-//   each of them takes at most three values). Every rectangle runs in
-//   its own repeated scope (Computation::fold): a single graph -- the
-//   tile extraction, the VAE pass on the tile, and the state update --
-//   is re-executed once per tile. The tile position is a function of
-//   the loop clock (the get_rows index tensors and the slot one-hot are
-//   per-iteration bindings, re-written before every execution), so the
-//   VAE graph holds one tile per rectangle, no matter how many tiles
-//   there are: the tile count is not bounded by a single context's
-//   capacity, and the live VAE activations are the rectangle's tiles
-//   plus the finished tiles.
-// - Each tile is blended with the tile above (axis 2) and the tile to
-//   the left (axis 3) with a linear ramp over the blend extent. The
-//   blending is in place, so every blend sees the already blended
-//   neighbors.
+// - Each tile is passed through `fn` (the full VAE) in its own graph
+//   scope, so no VAE graph ever contains more than one tile at a time:
+//   the tile count is not bounded by a single context's capacity, and
+//   the live VAE activations are one tile plus the finished tiles.
+// - Each tile is blended with the tile above (blend_v) and the tile to
+//   the left (blend_h) with a linear ramp over the blend extent. Like
+//   diffusers, the blending is in place: the blended tile replaces its
+//   raw tile, so every blend sees the already blended neighbors -- here
+//   as the state cells the earlier tile scopes persisted.
 // - A final scope keeps the first band_h x band_w output region of each
-//   blended tile (clipped to the true output extent on the borders) and
-//   concatenates the bands; the quarters dropped on the right and the
-//   bottom are the overlap regions that feed the next tiles' blending.
+//   blended tile and concatenates the bands; the quarters dropped on
+//   the right and the bottom are the overlap regions that feed the next
+//   tiles' blending.
 //
-// The tile size is given in the input space of fn (pixels for encode,
-// latent units for decode). out_fn() maps an input-space (h, w) to the
-// (B, Cout, h', w') output the network produces for an (h, w) input;
-// the blend extent and the band are derived from the full tile's output
-// (diffusers: blend_extent = int(tile * 0.25),
-// row_limit = tile - blend_extent).
+// The tile size is given in the input space of the method (pixels for
+// encode, latent units for decode); the blend extent and the band are
+// given in the output space.
 //
-template <class Fn, class OutFn>
-static Computation<Tensor> tiled_forward(
+template <class Fn>
+static std::vector<Computation<Tensor>> tiled_forward(
     Computation<Tensor> input,
     int64_t tile_h,
     int64_t tile_w,
-    OutFn out_fn,
+    int64_t blend_extent_h,
+    int64_t blend_extent_w,
+    int64_t band_h,
+    int64_t band_w,
     Fn fn)
 {
     if (tile_h <= 0 || tile_w <= 0)
@@ -225,13 +287,11 @@ static Computation<Tensor> tiled_forward(
     if (stride_h <= 0 || stride_w <= 0)
         throw std::invalid_argument("tiled_forward(): tile size too small (3/4 of it must be >= 1)");
 
-    // The input every tile reads. Materialized into the state context on
-    // the first dereference (it is a scope output), so all the tiles
-    // slice the same persistent tensor.
+    // The input every tile scope reads. Materialized into the state
+    // context on the first dereference (it is a scope output), so all
+    // the tile scopes slice the same persistent tensor.
     const Tensor in = *input;
 
-    const int64_t B = in.shape()[0];
-    const int64_t C_in = in.shape()[1];
     const int64_t H = in.shape()[2];
     const int64_t W = in.shape()[3];
 
@@ -239,280 +299,145 @@ static Computation<Tensor> tiled_forward(
     // tile slice would be the identity and there are no overlaps to
     // blend).
     if (H <= tile_h && W <= tile_w)
-        return input.scope([&fn](Scope scope, Tensor in) -> Tensor {
-            return fn(scope, in);
-        });
-
-    // The tile grid: R x C tiles (row-major), the border tiles clipped
-    // at the input borders (the input is zero-padded for the extraction
-    // only).
-    const int64_t R = (H - 1) / stride_h + 1;
-    const int64_t C = (W - 1) / stride_w + 1;
-    const int64_t H_pad = (R - 1) * stride_h + tile_h;
-    const int64_t W_pad = (C - 1) * stride_w + tile_w;
-    const size_t N = static_cast<size_t>(R) * static_cast<size_t>(C);
-
-    // The blend extent and band in the output space of the full tile.
-    const Tensor::Shape tile_out = out_fn(tile_h, tile_w);
-    const int64_t blend_h = tile_out[2] / 4;
-    const int64_t blend_w = tile_out[3] / 4;
-    const int64_t band_h = tile_out[2] - blend_h;
-    const int64_t band_w = tile_out[3] - blend_w;
-
-    // The full image's output shape (the final scope's band crop clips
-    // to it).
-    const Tensor::Shape full_out = out_fn(H, W);
-    const int64_t out_h = full_out[2];
-    const int64_t out_w = full_out[3];
-
-    // Zero-pad the input to the padded grid (one scope; the padded tensor
-    // is a state cell the tile scopes read as a leaf). Skipped when the
-    // grid already covers the input exactly.
-    Tensor in_pad = in;
-
-    if (H_pad != H || W_pad != W)
-        in_pad = *input.scope([&, B, C_in, H, W, H_pad, W_pad](Scope scope, Tensor in) -> Tensor {
-            auto out = in;
-
-            if (H_pad != H)
-                out = Tensor::cat({out, Tensor::zeros({B, C_in, H_pad - H, W})}, -2);
-
-            if (W_pad != W)
-                out = Tensor::cat({out, Tensor::zeros({B, C_in, H_pad, W_pad - W})}, -1);
-
-            return out;
-        });
-
-    // A class: a rectangle of the grid, every tile of it the same input
-    // size (tile_h x tile_w) and output shape out_fn(tile_h, tile_w).
-    struct Class {
-        int64_t i0, j0, rows, cols;
-        int64_t tile_h, tile_w;
-        Tensor::Shape out;
-    };
-
-    // The classes, row-major over the grid. The tile height (width)
-    // depends only on the row (column) and is non-increasing along it,
-    // so the rows (columns) of one height (width) are consecutive.
-    std::vector<Class> classes;
-    classes.reserve(9);
-
-    for (int64_t i = 0; i < R; ) {
-        const int64_t h = std::min(tile_h, H - i * stride_h);
-        int64_t rows = 1;
-
-        while (i + rows < R && std::min(tile_h, H - (i + rows) * stride_h) == h)
-            rows++;
-
-        for (int64_t j = 0; j < C; ) {
-            const int64_t w = std::min(tile_w, W - j * stride_w);
-            int64_t cols = 1;
-
-            while (j + cols < C && std::min(tile_w, W - (j + cols) * stride_w) == w)
-                cols++;
-
-            classes.push_back({i, j, rows, cols, h, w, out_fn(h, w)});
-            j += cols;
-        }
-
-        i += rows;
-    }
-
-    // The finished grid (row-major over the R x C tile grid).
-    std::vector<Tensor> tiles(N);
-
-    for (const auto& cls : classes) {
-        // The class's state cells (one zero-initialized cell per tile),
-        // overwritten by the class's output on every execution of its
-        // repeated scope below.
-        const size_t count = static_cast<size_t>(cls.rows) * static_cast<size_t>(cls.cols);
-
-        std::vector<Tensor> cells(count);
-
-        for (size_t k = 0; k < count; ++k) {
-            int64_t numel = 1;
-
-            for (int64_t d = 0; d < cls.out.rank(); ++d)
-                numel *= cls.out[d];
-
-            cells[k] = *input.state(cls.out, [numel](std::mt19937&) {
-                return std::vector<float>(numel, 0.0f);
-            });
-        }
-
-        Computation<std::vector<Tensor>> grid{cells, input.desc()};
-
-        grid.fold(count, [&, cls, in_pad, B, C_in, stride_h, stride_w](
-            Scope scope, size_t& iter, std::vector<Tensor> cells) -> std::vector<Tensor> {
-
-            const size_t count = static_cast<size_t>(cls.rows) * static_cast<size_t>(cls.cols);
-
-            // The get_rows index tensors (per-iteration: the providers
-            // read the loop clock). The index tensor must be
-            // [n_rows, ne2, ne3, 1] in ggml order: the tile's row
-            // (column) indices, repeated over the (B, C_in) batch/channel
-            // dimensions.
-            auto row_idx = scope.context().value<int32_t>(
-                {1, B, C_in, cls.tile_h},
-                [&iter, B, C_in, cls, stride_h](std::mt19937&) {
-                    const int64_t i = (cls.i0 + static_cast<int64_t>(iter) / cls.cols) * stride_h;
-                    std::vector<int32_t> data(B * C_in * cls.tile_h);
-
-                    for (int64_t b = 0; b < B; ++b)
-                        for (int64_t c = 0; c < C_in; ++c)
-                            for (int64_t r = 0; r < cls.tile_h; ++r)
-                                data[(b * C_in + c) * cls.tile_h + r] = static_cast<int32_t>(i + r);
-
-                    return data;
-                });
-
-            auto col_idx = scope.context().value<int32_t>(
-                {1, B, C_in, cls.tile_w},
-                [&iter, B, C_in, cls, stride_w](std::mt19937&) {
-                    const int64_t j = (cls.j0 + static_cast<int64_t>(iter) % cls.cols) * stride_w;
-                    std::vector<int32_t> data(B * C_in * cls.tile_w);
-
-                    for (int64_t b = 0; b < B; ++b)
-                        for (int64_t c = 0; c < C_in; ++c)
-                            for (int64_t r = 0; r < cls.tile_w; ++r)
-                                data[(b * C_in + c) * cls.tile_w + r] = static_cast<int32_t>(j + r);
-
-                    return data;
-                });
-
-            // The slot one-hot (per-iteration): marks the class cell
-            // this execution fills.
-            auto slot = scope.context().value<float>(
-                {static_cast<int64_t>(count)},
-                [&iter, count](std::mt19937&) {
-                    std::vector<float> data(count, 0.0f);
-                    data[iter] = 1.0f;
-                    return data;
-                });
-
-            // Extract the tile (B, C_in, cls.tile_h, cls.tile_w) from
-            // the padded input: get_rows gathers the tile's rows, then
-            // its columns (get_rows always gathers the second dimension;
-            // the transposes put the target axis in place). get_rows
-            // also requires its input contiguous along the first
-            // dimension: the intermediate transpose is materialized.
-            auto rows = Tensor(scope.runtime().get_rows(*in_pad, *row_idx), {B, C_in, cls.tile_h, W_pad});
-            auto cols = Tensor(scope.runtime().get_rows(*rows.transpose(2, 3).contiguous(), *col_idx), {B, C_in, cls.tile_w, cls.tile_h});
-            auto tile = cols.transpose(2, 3);
-
-            auto out = fn(scope, tile);
-
-            // Update the class's cells: the slot's cell takes the new
-            // tile, every other cell passes through unchanged (grid +
-            // (out - grid) * mask is exact on the passthrough slots: the
-            // mask is 0 and x + 0 == x).
-            std::vector<Tensor> next(count);
-
-            for (size_t m = 0; m < count; ++m)
-                next[m] = cells[m] + (out - cells[m]) * slot[{m}];
-
-            return next;
-        });
-
-        for (int64_t i = 0; i < cls.rows; ++i)
-            for (int64_t j = 0; j < cls.cols; ++j)
-                tiles[static_cast<size_t>((cls.i0 + i) * C + (cls.j0 + j))] = cells[static_cast<size_t>(i) * cls.cols + j];
-    }
-
-    // The final scope: blend the grid in place (every blend sees the
-    // already blended up and left neighbors), keep the first band_h x
-    //   band_w region of each blended tile -- clipped to the true output
-    //   extent on the borders -- and concatenate the bands into the full
-    //   output.
-    Computation<std::vector<Tensor>> grid{tiles, input.desc()};
-
-    return grid.scope([R, C, blend_h, blend_w, band_h, band_w, out_h, out_w](
-        Scope scope, std::vector<Tensor> tiles) -> Tensor {
-
-        // The (i, j) tile of the row-major grid.
-        const auto at = [C](int64_t i, int64_t j) -> size_t {
-            return static_cast<size_t>(i * C + j);
+        return {
+            input.scope([&fn](Scope scope, Tensor in) -> Tensor {
+                return fn(scope, in);
+            })
         };
 
-        std::vector<Tensor> blended(tiles);
+    // One scope per tile: the VAE pass on the tile slice plus the blends
+    // with the (already blended) up and left neighbors. The scope's
+    // output is the blended tile; it is persisted into the state context
+    // when a neighbor or the final scope dereferences it.
+    std::vector<std::vector<Computation<Tensor>>> rows;
 
-        for (int64_t i = 0; i < R; ++i)
-            for (int64_t j = 0; j < C; ++j) {
-                if (i > 0)
-                    blended[at(i, j)] = blend(scope, blended[at(i - 1, j)], blended[at(i, j)], blend_h, 2);
+    for (int64_t i = 0; i < H; i += stride_h) {
+        const size_t row_i = rows.size();
+        std::vector<Computation<Tensor>> row;
 
-                if (j > 0)
-                    blended[at(i, j)] = blend(scope, blended[at(i, j - 1)], blended[at(i, j)], blend_w, 3);
-            }
+        for (int64_t j = 0; j < W; j += stride_w) {
+            const size_t col_j = row.size();
 
-        std::vector<Tensor> bands(R);
+            auto up = (row_i > 0)
+                ? std::make_optional(*rows[row_i - 1][col_j])
+                : std::nullopt;
 
-        for (int64_t i = 0; i < R; ++i) {
-            const int64_t keep_h = std::min(band_h, out_h - i * band_h);
+            auto left = (col_j > 0)
+                ? std::make_optional(*row[col_j - 1])
+                : std::nullopt;
 
-            std::vector<Tensor> row(C);
+            row.push_back(input.scope([&, i, j](Scope scope, Tensor in) -> Tensor {
+                auto tile = in[{
+                    Tensor::Slice::all(),
+                    Tensor::Slice::all(),
+                    Tensor::Slice::range(i, i + tile_h),
+                    Tensor::Slice::range(j, j + tile_w)
+                }];
 
-            for (int64_t j = 0; j < C; ++j) {
-                const int64_t keep_w = std::min(band_w, out_w - j * band_w);
+                auto out = fn(scope, tile);
 
-                row[j] = blended[at(i, j)][{
+                if (up)
+                    out = blend_v(scope, *up, out, blend_extent_h);
+
+                if (left)
+                    out = blend_h(scope, *left, out, blend_extent_w);
+
+                return out;
+            }));
+        }
+
+        rows.push_back(std::move(row));
+    }
+
+    // The final scope: from each blended tile keep the top-left band
+    // (diffusers: row_limit = tile - blend_extent; clipped border tiles
+    // keep whatever they have left) and concatenate the bands into the
+    // full output.
+    auto result = input.scope([&, band_h, band_w](Scope scope) -> Tensor {
+        std::vector<Tensor> out_rows;
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            std::vector<Tensor> bands;
+
+            for (size_t j = 0; j < rows[i].size(); ++j) {
+                const Tensor tile = *rows[i][j];
+
+                const int64_t keep_h = std::min(tile.shape()[2], band_h);
+                const int64_t keep_w = std::min(tile.shape()[3], band_w);
+
+                bands.push_back(tile[{
                     Tensor::Slice::all(),
                     Tensor::Slice::all(),
                     Tensor::Slice::range(0, keep_h),
                     Tensor::Slice::range(0, keep_w)
-                }];
+                }]);
             }
 
-            bands[i] = Tensor::cat(row, -1);
+            out_rows.push_back(Tensor::cat(bands, -1));
         }
 
-        auto result = Tensor::cat(bands, -2);
-
-        // Tensor::cat() of a single tensor returns it as-is: single-band
-        // rows or columns are then bare views of state cells. Give the
-        // scope a real compute output.
-        if (!result.is_contiguous())
-            result = result.contiguous();
-
-        return result;
+        return Tensor::cat(out_rows, -2);
     });
+
+    // Every tile's computation (row-major) followed by the final
+    // computation: the caller can group them into an execution unit
+    // (Computation::unit), so the ExecutionRuntime runs the whole tiled
+    // pass as one progress step.
+    std::vector<Computation<Tensor>> computations;
+
+    for (auto& row : rows)
+        for (auto& tile : row)
+            computations.push_back(std::move(tile));
+
+    computations.push_back(std::move(result));
+    
+    return computations;
 }
 
-Computation<Tensor> AutoencoderKLFlux2::decode_tiled(Computation<Tensor> z, int64_t tile_h, int64_t tile_w) {
+std::vector<Computation<Tensor>> AutoencoderKLFlux2::decode_tiled(Computation<Tensor> z, int64_t tile_h, int64_t tile_w) {
     const int64_t scale = scale_factor();
 
     if (tile_h % scale != 0 || tile_w % scale != 0)
         throw std::invalid_argument("decode_tiled(): tile size must be divisible by the VAE's scale factor");
 
-    // The input's batch size (the out_fn() shapes below).
-    const int64_t B = z->shape()[0];
+    // Tile geometry in latent units (the input space of decode()).
+    const int64_t latent_tile_h = tile_h / scale;
+    const int64_t latent_tile_w = tile_w / scale;
 
-    // The tiles in latent units (the input space of decode()); the
-    // output is in pixels.
-    return tiled_forward(std::move(z), tile_h / scale, tile_w / scale,
-        [this, B, scale](int64_t h, int64_t w) {
-            return Tensor::Shape{B, out_channels_, h * scale, w * scale};
-        },
+    // Blend extent and row limit in pixel units (the output space).
+    //
+    // diffusers: blend_extent = int(tile_sample_min_size * 0.25),
+    //            row_limit    = tile_sample_min_size - blend_extent.
+    const int64_t blend_h = tile_h / 4;
+    const int64_t blend_w = tile_w / 4;
+    const int64_t band_h = tile_h - blend_h;
+    const int64_t band_w = tile_w - blend_w;
+
+    return tiled_forward(std::move(z), latent_tile_h, latent_tile_w, blend_h, blend_w, band_h, band_w,
         [this](Scope& s, const Tensor& tile) -> Tensor {
             return decode(s, tile);
         });
 }
 
-Computation<Tensor> AutoencoderKLFlux2::encode_tiled(Computation<Tensor> sample, int64_t tile_h, int64_t tile_w) {
+std::vector<Computation<Tensor>> AutoencoderKLFlux2::encode_tiled(Computation<Tensor> sample, int64_t tile_h, int64_t tile_w) {
     const int64_t scale = scale_factor();
 
     if (tile_h % scale != 0 || tile_w % scale != 0)
         throw std::invalid_argument("encode_tiled(): tile size must be divisible by the VAE's scale factor");
 
-    // The input's batch size (the out_fn() shapes below).
-    const int64_t B = sample->shape()[0];
+    const int64_t latent_tile_h = tile_h / scale;
+    const int64_t latent_tile_w = tile_w / scale;
 
-    // The tiles in pixels (the input space of encode()); the output is
-    // in latent units.
-    return tiled_forward(std::move(sample), tile_h, tile_w,
-        [this, B, scale](int64_t h, int64_t w) {
-            return Tensor::Shape{B, latent_channels_, (h + scale - 1) / scale, (w + scale - 1) / scale};
-        },
+    // Blend extent and row limit in latent units (the output space).
+    //
+    // diffusers: blend_extent = int(tile_latent_min_size * 0.25),
+    //            row_limit    = tile_latent_min_size - blend_extent.
+    const int64_t blend_h = latent_tile_h / 4;
+    const int64_t blend_w = latent_tile_w / 4;
+    const int64_t band_h = latent_tile_h - blend_h;
+    const int64_t band_w = latent_tile_w - blend_w;
+
+    return tiled_forward(std::move(sample), tile_h, tile_w, blend_h, blend_w, band_h, band_w,
         [this](Scope& s, const Tensor& tile) -> Tensor {
             return encode(s, tile).mode();
         });

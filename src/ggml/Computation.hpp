@@ -3,13 +3,16 @@
 #include "ggml/Context.hpp"
 #include "ggml/Scope.hpp"
 #include "ggml/Runtime.hpp"
+#include <algorithm>
 #include <deque>
 #include <memory>
 #include <set>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <iostream>
+#include <vector>
 
 // Computation is the build-phase value: a Tensor (a ggml tensor handle in
 // one of the computation's contexts) plus a shared Description of the whole
@@ -155,6 +158,20 @@ struct ComputationDescription {
     // captured in the Scope frames.
     std::deque<ComputationScope> scopes;
 
+    // A named group of scopes the ExecutionRuntime treats as one
+    // execution unit: the scopes of the unit run as a single named
+    // progress step (one increment per scope execution) instead of a
+    // separate progress bar per scope. The unit spans the contiguous
+    // scope range [begin, end) of the scopes deque (scopes are only
+    // appended, so the indexes stay valid).
+    struct Unit {
+        std::string name;
+        size_t begin; // first scope index (inclusive)
+        size_t end;   // one past the last scope index
+    };
+
+    std::vector<Unit> units;
+
     Context& context() {
         if (!state)
             state.emplace(6000 /*TODO: remove temporary fix to get around context exhaustion problem*/);
@@ -183,6 +200,16 @@ struct ComputationDescription {
 
         return nullptr;
     }
+
+    // The index of the given scope in the scopes deque (scopes.size()
+    // when the scope is not one of the deque's elements).
+    size_t scope_index(const ComputationScope* scope) const {
+        for (size_t i = 0; i < scopes.size(); ++i)
+            if (&scopes[i] == scope)
+                return i;
+
+        return scopes.size();
+    }
 };
 
 template <class T>
@@ -204,17 +231,29 @@ public:
         using type = std::invoke_result_t<Body&, T&>;
     };
 
-    template <class Body, bool Void = std::is_void_v<T>>
+    template <class Body,
+              bool Void = std::is_void_v<T>,
+              bool TakesValue = std::is_invocable_v<Body&, Scope&, Ref&>>
     struct ScopeResult;
 
+    // The body of a void computation takes only the scope.
     template <class Body>
-    struct ScopeResult<Body, true> {
+    struct ScopeResult<Body, true, false> {
         using type = std::invoke_result_t<Body&, Scope&>;
     };
 
+    // The body of a non-void computation takes the value as a second
+    // argument.
     template <class Body>
-    struct ScopeResult<Body, false> {
+    struct ScopeResult<Body, false, true> {
         using type = std::invoke_result_t<Body&, Scope&, T&>;
+    };
+
+    // ...or omits the value argument entirely. The value is then not
+    // passed to the body, so the body cannot reference it.
+    template <class Body>
+    struct ScopeResult<Body, false, false> {
+        using type = std::invoke_result_t<Body&, Scope&>;
     };
 
     template <class Body, bool Void = std::is_void_v<T>>
@@ -251,6 +290,76 @@ public:
         return {
             std::move(values),
             first.desc_
+        };
+    }
+
+    //
+    // Groups the given computations into one named execution unit.
+    //
+    // Like all(), every computation must belong to the same description
+    // (the scopes of one computation). The scopes that produce the given
+    // values are registered in the description as a single execution
+    // unit: the ExecutionRuntime runs them as one named progress step
+    // (one increment per scope execution) instead of a separate progress
+    // bar per scope, and may use the unit boundary to optimize the
+    // execution.
+    //
+    // The unit spans the scope range from the producing scope of the
+    // first given value to the producing scope of the last given value
+    // (both inclusive); a value that lives outside the scope contexts
+    // (in the state or a pinned context) does not extend the range. The
+    // returned computation carries the value of the last given
+    // computation (the unit's result).
+    //
+    static Computation<T> unit(const std::string& name, const std::vector<Computation<T>>& computations) {
+        if (computations.empty())
+            throw std::runtime_error("unit(): no computations");
+
+        auto desc = computations.front().desc_;
+
+        for (auto& c : computations)
+            if (c.desc_ != desc)
+                throw std::runtime_error(
+                    "unit(): computations have different descriptions");
+
+        size_t begin = 0;
+        size_t end = 0;
+        bool found = false;
+
+        for (auto& c : computations) {
+            for (auto& value : ComputationValue<T>::unwrap(c.ref_)) {
+                auto* scope = desc->find_scope(value);
+
+                if (scope == nullptr)
+                    continue;
+
+                auto index = desc->scope_index(scope);
+
+                if (!found) {
+                    begin = index;
+                    end = index + 1;
+                    found = true;
+                } else {
+                    begin = std::min(begin, index);
+                    end = std::max(end, index + 1);
+                }
+            }
+        }
+
+        if (!found)
+            throw std::runtime_error(
+                "unit(): none of the given values lives in a scope context");
+
+        for (auto& u : desc->units)
+            if (begin < u.end && u.begin < end)
+                throw std::runtime_error(
+                    "unit(): '" + name + "' overlaps the scopes of unit '" + u.name + "'");
+
+        desc->units.push_back({name, begin, end});
+
+        return {
+            computations.back().ref_,
+            desc
         };
     }
 
@@ -324,7 +433,8 @@ public:
     // wraps the output(s) of the body. Because the temporary context is
     // disposable after execution, the outputs survive across scopes only
     // through a dereference (operator*), which materializes them into the
-    // state context.
+    // state context. For a non-void computation the body may also omit the
+    // value argument entirely; the value is then not passed to it.
     template <class Body>
     auto scope(Body body) -> Computation<typename ScopeResult<Body>::type> {
         using U = typename ScopeResult<Body>::type;
@@ -336,8 +446,10 @@ public:
 
         if constexpr (std::is_void_v<T>) {
             out = body(scope);
-        } else {
+        } else if constexpr (std::is_invocable_v<Body&, Scope&, Ref&>) {
             out = body(scope, **this);
+        } else {
+            out = body(scope);
         }
 
         auto values = ComputationValue<U>::unwrap(out);

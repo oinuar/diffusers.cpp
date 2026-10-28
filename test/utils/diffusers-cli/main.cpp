@@ -282,10 +282,10 @@ public:
             Computation<Tensor> result;
 
             if (args_.get(0) == "AutoencoderKLFlux2_encode_tiled")
-                result = model.encode_tiled(Computation<Tensor>(sample, computation.desc()), *tile_size, *tile_size);
+                result = Computation<Tensor>::unit("VAE encode", model.encode_tiled(Computation<Tensor>(sample, computation.desc()), *tile_size, *tile_size));
 
             else if (args_.get(0) == "AutoencoderKLFlux2_decode_tiled")
-                result = model.decode_tiled(Computation<Tensor>(sample, computation.desc()), *tile_size, *tile_size);
+                result = Computation<Tensor>::unit("VAE decode", model.decode_tiled(Computation<Tensor>(sample, computation.desc()), *tile_size, *tile_size));
 
             else
                 result = computation.scope([&](Scope scope) -> Tensor {

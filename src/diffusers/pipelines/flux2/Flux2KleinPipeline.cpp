@@ -386,11 +386,16 @@ std::optional<Computation<Tensor>> Flux2KleinPipeline::encode_images(Computation
             });
 
         // (B, C, H / scale, W / scale)
-        auto mode = (tile_size > 0)
-            ? vae_.encode_tiled(img_tensor, tile_size, tile_size)
-            : img_tensor.scope([this](Scope scope, Tensor sample) -> Tensor {
-                return this->vae_.encode(scope, sample).mode();
-            });
+        std::vector<Computation<Tensor>> encode_unit;
+
+        if (tile_size > 0)
+            encode_unit = vae_.encode_tiled(img_tensor, tile_size, tile_size);
+        else
+            encode_unit = {
+                img_tensor.scope([this](Scope scope, Tensor sample) -> Tensor {
+                    return this->vae_.encode(scope, sample).mode();
+                })
+            };
 
         auto packed_h = img.height() / vae_multiple;
         auto packed_w = img.width() / vae_multiple;
@@ -398,7 +403,7 @@ std::optional<Computation<Tensor>> Flux2KleinPipeline::encode_images(Computation
         // 1. Patchify: (B, C, H, W) -> (B, 4C, H/2, W/2)
         // 2. Apply BN normalization to the patchified latents.
         // 3. Pack: (B, 4C, H/2, W/2) -> (B, H/2 * W/2, 4C)
-        auto packed = mode.scope([this, packed_h, packed_w](Scope scope, Tensor mode) -> Tensor {
+        auto packed = encode_unit.back().scope([this, packed_h, packed_w](Scope scope, Tensor mode) -> Tensor {
             auto patched = patchify_latents(mode, vae_.latent_channels(), packed_h, packed_w);
 
             auto bn_mean = (*vae_.bn()->running_mean())->reshape({1, -1, 1, 1});
@@ -408,7 +413,11 @@ std::optional<Computation<Tensor>> Flux2KleinPipeline::encode_images(Computation
             return pack_latents(patched);
         });
 
-        packed_imgs.push_back(std::move(packed));
+        // One execution unit for the whole reference-image encode step
+        // (the VAE encode scopes plus the pack scope).
+        encode_unit.push_back(packed);
+
+        packed_imgs.push_back(Computation<Tensor>::unit("VAE encode", encode_unit));
     }
 
     // Concatenate the reference images along the token dimension:
@@ -560,10 +569,16 @@ Computation<Tensor> Flux2KleinPipeline::decode(Computation<Tensor> latents, int 
     });
 
     // 2. VAE decode (tiled).
-    if (tile_size > 0)
-        return vae_.decode_tiled(z, tile_size, tile_size);   // (B, 3, H, W)
+    if (tile_size > 0) {
+        auto decode_unit = vae_.decode_tiled(z, tile_size, tile_size);
+        decode_unit.insert(decode_unit.begin(), z);
 
-    return z;
+        // One execution unit for the whole VAE decode step (the unpack
+        // scope, the tile scopes, and the final scope).
+        return Computation<Tensor>::unit("VAE decode", decode_unit);   // (B, 3, H, W)
+    }
+
+    return Computation<Tensor>::unit("VAE decode", {z});
 }
 
 Flux2KleinPipeline Flux2KleinPipeline::from_pretrained(Context& vae_context, Context& text_encoder_context, Context& transformer_context, const std::filesystem::path& path) {

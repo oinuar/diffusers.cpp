@@ -154,12 +154,44 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
     if (desc.state)
         bind(rng, *desc.state, /*once_only=*/true);
 
+    // The execution units: the scopes of a unit run as one named
+    // progress step (one increment per scope execution of the unit)
+    // instead of a separate "Computing" progress bar per scope.
+    std::vector<int> unit_of(desc.scopes.size(), -1);
+    std::vector<int> unit_total(desc.units.size(), 0);
+
+    for (size_t u = 0; u < desc.units.size(); ++u) {
+        for (size_t i = desc.units[u].begin; i < desc.units[u].end; ++i) {
+            unit_of[i] = static_cast<int>(u);
+
+            // Count the same scope executions the loop below performs.
+            if (desc.scopes[i].context)
+                unit_total[u] += desc.scopes[i].repeat ? static_cast<int>(desc.scopes[i].repeat->count) : 1;
+        }
+    }
+
+    // The unit whose progress bar is open (-1: none).
+    int unit = -1;
+
     for (auto i = 0; i < desc.scopes.size(); ++i) {
         auto& r = desc.scopes[i];
         auto* gf = graphs[i];
 
         if (!r.context)
             continue;
+
+        // Open / close the progress bar of the scope's execution unit.
+        auto scope_unit = unit_of[i];
+
+        if (scope_unit != unit) {
+            if (progress && unit >= 0)
+                progress->pop();
+
+            if (progress && scope_unit >= 0)
+                progress->push(desc.units[scope_unit].name, unit_total[scope_unit]);
+
+            unit = scope_unit;
+        }
 
         // Allocate this scope's scratch context on demand: at any point
         // in time only the weights, the state, and at most one scope
@@ -204,7 +236,8 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
 
         // Handle repeating computation with re-binding and state carrying.
         if (r.repeat) {
-            if (progress)
+            // A unit scope advances the unit's progress bar below.
+            if (progress && scope_unit < 0)
                 progress->push("Computing (" + std::to_string(ggml_graph_n_nodes(gf)) + " graph nodes)", r.repeat->count);
 
             // The graph is a single allocation with multiple computations:
@@ -236,13 +269,13 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
                     progress->next();
             }
 
-            if (progress)
+            if (progress && scope_unit < 0)
                 progress->pop();
         }
 
         // Otherwise, handle singular computation.
         else {
-            if (progress)
+            if (progress && scope_unit < 0)
                 progress->push("Computing (" + std::to_string(ggml_graph_n_nodes(gf)) + " graph nodes)", 1);
 
             // The re-bindable inputs of a single-execution scope have no
@@ -253,10 +286,11 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
             if (ggml_backend_graph_compute(*backend, gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("run(): ggml_backend_graph_compute failed");
 
-            if (progress) {
+            if (progress)
                 progress->next();
+
+            if (progress && scope_unit < 0)
                 progress->pop();
-            }
         }
 
         // Copy state tensors.
@@ -269,6 +303,9 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
         // state context -- so every scope context is disposable.
         r.context->release();
     }
+
+    if (progress && unit >= 0)
+        progress->pop();
 
     if (progress)
         progress->pop();

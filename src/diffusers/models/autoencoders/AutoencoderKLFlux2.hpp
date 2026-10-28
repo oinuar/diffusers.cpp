@@ -42,27 +42,27 @@ public:
     //
     // Tiled variants of decode()/encode(), mirroring diffusers'
     // tiled_decode()/_tiled_encode(): the input is split into overlapping
-    // tiles (3/4 stride), each tile is run through the full VAE, and the
-    // overlaps are blended with linear ramps (a quarter of the tile size).
+    // tiles (3/4 stride), each tile is run through the full VAE in its
+    // own scope, and the overlaps are blended with linear ramps (a
+    // quarter of the tile size).
     //
     // This bounds the live memory of the full-resolution VAE activations
-    // to the tile size regardless of the image size.
+    // to the tile size regardless of the image size: the tile count is
+    // not bounded by a single context's capacity.
     //
-    // The tile grid is split into classes of equal sized tiles (the
-    // interior tiles and the clipped border row and column tiles). Each
-    // class runs in its own repeated graph scope: a single graph (the
-    // VAE pass on one class tile) is re-executed once per class tile,
-    // so the VAE graph never holds more than one tile per class at a
-    // time: the tile count is not bounded by the context capacity. The
-    // border tiles are clipped exactly like diffusers'.
+    // Returns every tile's computation (row-major) followed by the
+    // computation of the final blended result: the caller can group the
+    // vector into an execution unit (Computation::unit), so the
+    // ExecutionRuntime runs the whole tiled pass as one progress step.
     //
     // tile_h/tile_w are the tile sizes in pixels (they must be divisible
     // by the VAE's scale factor).
     //
-    Computation<Tensor> decode_tiled(Computation<Tensor> z, int64_t tile_h, int64_t tile_w);
+    std::vector<Computation<Tensor>> decode_tiled(Computation<Tensor> z, int64_t tile_h, int64_t tile_w);
 
-    // Returns the blended latent mode (B, latent_channels, H / scale, W / scale).
-    Computation<Tensor> encode_tiled(Computation<Tensor> sample, int64_t tile_h, int64_t tile_w);
+    // As decode_tiled(), for encode(): the final computation is the
+    // blended latent mode (B, latent_channels, H / scale, W / scale).
+    std::vector<Computation<Tensor>> encode_tiled(Computation<Tensor> sample, int64_t tile_h, int64_t tile_w);
 
     Tensor forward(Scope scope, Tensor sample, bool sample_posterior = false);
     
