@@ -9,7 +9,7 @@
 
 class Parameter;
 class Module;
-class Flux2FeedForward;
+class Flux2FusedLinearIn;
 
 class RethrowVisitor : public Visitor {
 public:
@@ -39,7 +39,7 @@ public:
         });
     }
 
-    void visit(Flux2FeedForward& module, std::vector<std::string> path) override {
+    void visit(Flux2FusedLinearIn& module, std::vector<std::string> path) override {
         visitWithCatch([&] {
             parent_.visit(module, std::move(path));
         });

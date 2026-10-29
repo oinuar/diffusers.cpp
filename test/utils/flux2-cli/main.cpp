@@ -28,13 +28,12 @@ public:
         if (args_.get(0) == "Flux2SwiGLU") {
             Computation<void> computation({&context});
 
-            auto gate = args_.get_one<Tensor>("--gate", {computation.desc()->context()});
-            auto up = args_.get_one<Tensor>("--up", {computation.desc()->context()});
+            auto x = args_.get_one<Tensor>("--x", {computation.desc()->context()});
 
             Flux2SwiGLU model;
 
             auto result = computation.scope([&](Scope scope) -> Tensor {
-                return model.forward(scope, gate, up);
+                return model.forward(scope, x);
             });
 
             return Computation<Tensor>::all(result);
@@ -843,20 +842,20 @@ private:
             }
         }
 
-        void visit(Flux2FeedForward& feed_forward, std::vector<std::string> path) override {
+        void visit(Flux2FusedLinearIn& linear_in, std::vector<std::string> path) override {
             ModulePath module_path("-", "--param");
-            auto weight_path = module_path(path, prefix(), {"linear_in", "weight"});
+            auto weight_path = module_path(path, prefix(), {"weight"});
 
-            auto gate_weight = feed_forward.linear_in_gate()->weight();
-            auto up_weight = feed_forward.linear_in_up()->weight();
+            auto gate_weight = linear_in.gate()->weight();
+            auto up_weight = linear_in.up()->weight();
 
             // The fused linear_in weight is (inner * 2) x dim (PyTorch
             // layout): the first inner rows are the gate, the last inner
             // rows the up projection.
-            auto inner = gate_weight->shape()[0];
-            auto dim = gate_weight->shape()[1];
+            auto inner = linear_in.inner_dim();
+            auto dim = linear_in.dim();
 
-            if (auto type = quantization().resolve(dot_name(path) + ".linear_in.weight", prefix()); type && *type != GGML_TYPE_F32) {
+            if (auto type = quantization().resolve(dot_name(path) + ".weight", prefix()); type && *type != GGML_TYPE_F32) {
                 // Quantized weight: the file holds the raw bytes of the
                 // fused tensor. The rows are contiguous in memory, so the
                 // split into gate/up is a plain byte-range slice.
@@ -866,7 +865,7 @@ private:
 
                 if (data.size() != row_bytes * (inner * 2))
                     throw std::runtime_error(
-                        "Flux2FeedForward: quantized weight '" + weight_path +
+                        "Flux2FusedLinearIn: quantized weight '" + weight_path +
                         "' has " + std::to_string(data.size()) + " bytes, expected " +
                         std::to_string(row_bytes * (inner * 2)));
 
@@ -875,34 +874,35 @@ private:
 
                 up_weight->set(create_quantized(weight_path + "-up-weight", up_weight->shape(), *type,
                     slice_rows_bytes(data, *type, dim, inner, inner * 2)));
-            }
-            else {
-                auto weight_value = get_param(weight_path);
-                ArgumentParser::parser<Tensor>::TensorParser parser(weight_path, weight_value);
 
-                auto [shape, data] = parser.parse();
-
-                gate_weight->set(context().create<float>(gate_weight->shape(), [=](std::mt19937&) {
-                    return slice_rows(data, dim, 0, inner);
-                }).name(weight_path + "-gate-weight"));
-
-                up_weight->set(context().create<float>(up_weight->shape(), [=](std::mt19937&) {
-                    return slice_rows(data, dim, inner, inner * 2);
-                }).name(weight_path + "-up-weight"));
+                return;
             }
 
-            auto gate_bias = feed_forward.linear_in_gate()->bias();
+            auto weight_value = get_param(weight_path);
+            ArgumentParser::parser<Tensor>::TensorParser parser(weight_path, weight_value);
+
+            auto [shape, data] = parser.parse();
+
+            gate_weight->set(context().create<float>(gate_weight->shape(), [=](std::mt19937&) {
+                return slice_rows(data, dim, 0, inner);
+            }).name(weight_path + "-gate-weight"));
+
+            up_weight->set(context().create<float>(up_weight->shape(), [=](std::mt19937&) {
+                return slice_rows(data, dim, inner, inner * 2);
+            }).name(weight_path + "-up-weight"));
+
+            auto gate_bias = linear_in.gate()->bias();
 
             if (gate_bias) {
-                auto bias_path = module_path(path, prefix(), {"linear_in", "bias"});
+                auto bias_path = module_path(path, prefix(), {"bias"});
 
                 // The fused bias is 1-D of length inner * 2: the first
                 // inner elements belong to the gate, the last inner to
                 // the up projection.
-                if (auto type = quantization().resolve(dot_name(path) + ".linear_in.bias", prefix()); type && *type != GGML_TYPE_F32) {
+                if (auto type = quantization().resolve(dot_name(path) + ".bias", prefix()); type && *type != GGML_TYPE_F32) {
                     auto data = get_param_bytes(bias_path);
 
-                    auto up_bias = feed_forward.linear_in_up()->bias();
+                    auto up_bias = linear_in.up()->bias();
 
                     gate_bias->set(create_quantized(bias_path + "-gate-bias", gate_bias->shape(), *type,
                         slice_cols_bytes(data, *type, 1, inner * 2, 0, inner)));
@@ -916,7 +916,7 @@ private:
 
                     auto [bias_shape, bias_data] = bias_parser.parse();
 
-                    auto up_bias = feed_forward.linear_in_up()->bias();
+                    auto up_bias = linear_in.up()->bias();
 
                     gate_bias->set(context().create<float>(gate_bias->shape(), [=](std::mt19937&) {
                         return slice_cols(bias_data, 1, inner * 2, 0, inner);
@@ -926,20 +926,6 @@ private:
                         return slice_cols(bias_data, 1, inner * 2, inner, inner * 2);
                     }).name(bias_path + "-up-bias"));
                 }
-            }
-
-            auto linear_out = feed_forward.linear_out();
-
-            auto out_weight_path = path;
-            out_weight_path.push_back("linear_out");
-            out_weight_path.push_back("weight");
-            TestCLI::CreateParametersVisitor::visit(*linear_out->weight(), std::move(out_weight_path));
-
-            if (auto out_bias = linear_out->bias()) {
-                auto out_bias_path = path;
-                out_bias_path.push_back("linear_out");
-                out_bias_path.push_back("bias");
-                TestCLI::CreateParametersVisitor::visit(*out_bias, std::move(out_bias_path));
             }
         }
 

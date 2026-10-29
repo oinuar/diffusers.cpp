@@ -15,15 +15,16 @@ public:
         inner_dim_(inner_dim),
         mlp_hidden_dim_(mlp_hidden_dim)
     {
-        // Attention output projection + MLP output projection. The
-        // reference fuses these into one Linear over the concatenated
-        // inputs; we keep them separate and add the outputs: the attention
-        // output leaves flash_attn_ext heads-sharded (S(0) once flattened)
-        // and must go through a row-parallel projection (weight S(0) +
-        // activation S(0) -> PARTIAL -> AllReduce -> R) -- the meta backend
-        // forbids a concat along the sharded axis, so the fused form
-        // (concat + one Linear) is infeasible there. By linearity of the
-        // matmul, W @ [attn | mlp] == W_attn @ attn + W_mlp @ mlp.
+        // Sharding patch for the reference's fused to_out Linear:
+        // the reference fuses the attention output + MLP output
+        // projections into one Linear over the concatenated inputs; we
+        // keep them separate and add the outputs: the attention
+        // output leaves flash_attn_ext heads-sharded (S(0) once
+        // flattened) and must go through a row-parallel projection
+        // (weight S(0) + activation S(0) -> PARTIAL -> AllReduce -> R)
+        // -- the meta backend forbids a concat along the sharded axis,
+        // so the fused form (concat + one Linear) is infeasible there.
+        // By linearity of the matmul, W @ [attn | mlp] == W_attn @ attn + W_mlp @ mlp.
         modules["attn"] = std::make_shared<Linear>(inner_dim_, out_dim_, bias);
         modules["mlp"] = std::make_shared<Linear>(mlp_hidden_dim_, out_dim_, false);
     }

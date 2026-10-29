@@ -5,32 +5,26 @@ from diffusers.models.transformers.transformer_flux2 import Flux2SwiGLU
 class TestFlux2SwiGLU(TestCase):
     def test_1d(self):
         model = Flux2SwiGLU()
-        gate = torch.randn(2)
-        up = torch.randn(2)
+        x = torch.randn(4)
 
-        # The C++ side computes the split form: silu(gate) * up, while the
-        # reference chunks the fused (gate | up) tensor.
-        expected = model.forward(torch.cat([gate, up]))
+        expected = model(x)
 
         actual = self.cli(
             'Flux2SwiGLU',
-            '--gate', str(gate.tolist()),
-            '--up', str(up.tolist()),
+            '--x', str(x.tolist()),
         )
 
         self.assertTensors(actual, [expected])
 
     def test_2d(self):
-            model = Flux2SwiGLU()
-            gate = torch.randn(2, 12)
-            up = torch.randn(2, 12)
+        model = Flux2SwiGLU()
+        x = torch.randn(2, 12)
 
-            expected = model.forward(torch.cat([gate, up], dim=-1))
+        expected = model(x)
 
-            actual = self.cli(
-                'Flux2SwiGLU',
-                '--gate', str(gate.tolist()),
-                '--up', str(up.tolist()),
-            )
+        actual = self.cli(
+            'Flux2SwiGLU',
+            '--x', str(x.tolist()),
+        )
 
-            self.assertTensors(actual, [expected])
+        self.assertTensors(actual, [expected])

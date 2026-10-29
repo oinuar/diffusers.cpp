@@ -4,7 +4,7 @@
 #include "nn/ModulePath.hpp"
 #include "diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp"
 #include "diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp"
-#include "diffusers/models/transformers/flux2/Flux2FeedForward.hpp"
+#include "diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp"
 #include <string>
 #include <fstream>
 #include <iostream>
@@ -367,21 +367,21 @@ void GGUFLoaderVisitor::visit(Flux2FusedAttentionOutput& to_out, std::vector<std
     }
 }
 
-void GGUFLoaderVisitor::visit(Flux2FeedForward& feed_forward, std::vector<std::string> path) {
+void GGUFLoaderVisitor::visit(Flux2FusedLinearIn& linear_in, std::vector<std::string> path) {
     ModulePath module_path;
-    auto weight_path = module_path(path, {}, {"linear_in", "weight"});
+    auto weight_path = module_path(path, {}, {"weight"});
 
     auto weight = load_tensor(weight_path);
 
-    auto gate_weight = feed_forward.linear_in_gate()->weight();
-    auto up_weight = feed_forward.linear_in_up()->weight();
+    auto gate_weight = linear_in.gate()->weight();
+    auto up_weight = linear_in.up()->weight();
 
     // The fused linear_in weight is (inner * 2) x dim (PyTorch layout).
     // The first inner rows are the gate projection, the last inner rows
     // the up projection (the reference chunks the fused output down the
     // middle in Flux2SwiGLU).
-    auto inner = gate_weight->shape()[0];
-    auto dim = gate_weight->shape()[1];
+    auto inner = linear_in.inner_dim();
+    auto dim = linear_in.dim();
 
     if (weight.rows != inner * 2 || weight.cols != dim)
         throw std::runtime_error(
@@ -396,13 +396,13 @@ void GGUFLoaderVisitor::visit(Flux2FeedForward& feed_forward, std::vector<std::s
     up_weight->set(create_weight(context_, weight_path + "-up-weight", up_weight->shape(), weight.type,
         read_rows(file_, weight, inner, inner * 2, weight_path + "-up-weight")));
 
-    auto gate_bias = feed_forward.linear_in_gate()->bias();
+    auto gate_bias = linear_in.gate()->bias();
 
     if (gate_bias) {
-        auto bias_path = module_path(path, {}, {"linear_in", "bias"});
+        auto bias_path = module_path(path, {}, {"bias"});
         auto bias = load_tensor(bias_path);
 
-        auto up_bias = feed_forward.linear_in_up()->bias();
+        auto up_bias = linear_in.up()->bias();
 
         // The fused bias is 1-D of length inner * 2; the first inner
         // elements belong to the gate, the last inner to the up.
@@ -411,20 +411,5 @@ void GGUFLoaderVisitor::visit(Flux2FeedForward& feed_forward, std::vector<std::s
 
         up_bias->set(create_weight(context_, bias_path + "-up-bias", up_bias->shape(), bias.type,
             read_cols(file_, bias, inner, inner * 2, bias_path + "-up-bias")));
-    }
-
-    auto out_path = path;
-    out_path.push_back("linear_out");
-
-    auto linear_out = feed_forward.linear_out();
-
-    auto out_weight_path = out_path;
-    out_weight_path.push_back("weight");
-    visit(*linear_out->weight(), std::move(out_weight_path));
-
-    if (auto out_bias = linear_out->bias()) {
-        auto out_bias_path = out_path;
-        out_bias_path.push_back("bias");
-        visit(*out_bias, std::move(out_bias_path));
     }
 }

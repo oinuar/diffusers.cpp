@@ -58,6 +58,17 @@ public:
         return *current_runtime_;
     }
 
+    // True when the active scope is traced through a sharding runtime
+    // (meta device). Used by modules to decide whether they must use
+    // the sharding-adjusted form of their graphs: a module built (or
+    // forwarded) under a sharding scope uses the split form, every
+    // other scope runs the 1:1 reference form.
+    //
+    // The query answers for the currently active scope, so it can also
+    // be made at module construction time (before any scope object
+    // exists); with no active scope it reports not sharded.
+    static bool sharded();
+
 private:
     struct Frame {
         Context* previous_context;

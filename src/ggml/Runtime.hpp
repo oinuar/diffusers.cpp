@@ -8,6 +8,12 @@ class Runtime {
 public:
     virtual ~Runtime() = default;
 
+    // True when the runtime shards tensors across multiple devices
+    // (meta device): modules built under such a runtime use the
+    // sharding-adjusted form of their graphs instead of the 1:1
+    // reference form.
+    virtual bool sharded() const { return false; }
+
     // -------------------------------------------------------------------------
     // Tensor creation / initialization
     // -------------------------------------------------------------------------

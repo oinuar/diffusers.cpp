@@ -85,14 +85,29 @@ Translate the Python `forward` line by line with the [tensor operator syntax](#t
 - Return a `Tensor` built from ops; no in-place mutation, no autograd.
 - Call sub-modules through the typed accessors (`static_pointer_cast`), mirroring `self.sub_module(...)` calls.
 
-### 2.3 Handle fused weights, if any
+### 2.3 Module patches, if sharding demands an adjustment
 
-If the Python class fuses several logical projections into one weight (one `nn.Linear` serving q/k/v, or gate/up), **do not mirror the fusion**: keep separate `Linear` children and add a dedicated `visit()` overload in `GGUFLoaderVisitor` that slices the fused GGUF tensor at load time.
+The reference form of a module stays 1:1 with Python; an adjustment the sharding planner forces (step 4) is a **module patch** applied only when the graph is traced through a sharding runtime, never unconditionally. Every current patch splits a fused weight; the pattern generalizes to any adjustment.
 
-- Row slices use `read_rows` (rows are contiguous in the file — one seek+read). Example: [`Flux2FusedQKVProjection`](src/diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp) — Python's `to_qkv_mlp_proj` (one weight of shape `(3·inner + mlp_out) × query_dim`) becomes separate `q`, `k`, `v`, `mlp_in_gate`, and `mlp_in_up` projections.
-- Column slices use `read_cols` (one seek+read per row; boundaries must be aligned to the quantization block size so quantized types like Q8_0 slice without dequantization). Example: [`Flux2FusedAttentionOutput`](src/diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp) — Python's `to_out` (one projection over the concatenated `[attn; mlp]` features) becomes `attn` / `mlp`; [`Flux2FeedForward`](src/diffusers/models/transformers/flux2/Flux2FeedForward.hpp) splits `linear_in` into `linear_in_gate` / `linear_in_up`, including the 1-D fused bias.
+**Two forms under one name.** The patched parent keeps both forms under the same child names, so the module tree and the checkpoint tensor names are Python's in both modes:
 
-The math is identical — a row or column slice of a projection *is* that projection. The decomposition exists for sharding (step 4).
+- **Reference form (default):** plain `Linear` children, exactly like Python's `nn.Linear` (e.g. `attn.to_qkv_mlp_proj` = `Linear(query_dim, 3·inner + mlp_out)`); `forward` calls them and `split` / `chunk`s their output, mirroring Python line by line. The generic `GGUFLoaderVisitor` traversal loads the fused tensors as-is.
+- **Patch form:** a dedicated patch module holds the split children instead. Examples: [`Flux2FusedQKVProjection`](src/diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp) replaces `to_qkv_mlp_proj` with `q` / `k` / `v` / `mlp_in_gate` / `mlp_in_up` Linears; [`Flux2FusedAttentionOutput`](src/diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp) replaces `to_out` with `attn` / `mlp` Linears; in `Flux2FeedForward` the `linear_in` child is a [`Flux2FusedLinearIn`](src/diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp) with `gate` / `up` Linears instead of a fused `Linear`.
+
+**Mode selection.** `Scope::sharded()` is true only when the active scope is traced through a `ShardingRuntime` (the meta device); it is queryable at construction time (before any scope exists it reports not sharded) and during `forward`. The constructor records it (`sharded_ = Scope::sharded()`), builds the mode-appropriate children, and `forward` branches on the same query, throwing a clear error if the module was built for the other mode.
+
+**Patch module anatomy** (see the three examples): `Linear` children named after the split projections, with typed accessors; a `forward` that performs the split computation (one GEMM per projection, returned as a tuple); and an `accept()` that always dispatches to the module-specific visit (`visitor.visit(*this, std::move(path))`), never to the generic traversal.
+
+**Loader plumbing** — one overload per patch type, in three places:
+
+1. `src/nn/Visitor.hpp` declares the no-op `virtual void visit(<Patch>&, std::vector<std::string>) {}`; `RethrowVisitor` wraps it with `visitWithCatch`.
+2. `GGUFLoaderVisitor` implements it: resolve the fused tensor at the patch's own path (`module_path(path, {}, {"weight"})`), validate its shape, and fill each split child from a slice:
+   - row slices via `read_rows` (rows are contiguous in the file — one seek+read), e.g. `to_qkv_mlp_proj` → `q` / `k` / `v` / `mlp_in_gate` / `mlp_in_up`;
+   - column slices via `read_cols` (one seek+read per row; boundaries must align to the quantization block size so quantized types like Q8_0 slice without dequantization), e.g. `to_out` → `attn` / `mlp`;
+   - a fused 1-D bias is column-sliced as well (`linear_in.bias` → `gate.bias` / `up.bias`).
+3. The test CLI's `CreateParametersVisitor` mirrors the overload: the test still passes the fused tensor under the Python name (`--param-linear_in-weight`) and the visit slices it — F32 rows/cols, or raw quantized bytes (`slice_*_bytes`) when the quantization spec resolves a non-F32 type.
+
+The split math is identical to the reference — a row or column slice of a projection *is* that projection — so a patch changes where the computation lives, never what it computes. `GGUFLoaderVisitor` may reference only patch modules; every real module loads through the generic traversal.
 
 ### 2.4 Test it
 
@@ -131,12 +146,13 @@ Port the core inference path and drop the Python surface the C++ runtime cannot 
 
 ## 4. Make it shardable
 
-Run the suite with two devices: `N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure`. If the planner reports an infeasible plan (it prints the reason), fix the model with these rules:
+Run the suite with two devices: `N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure`. If the planner reports an infeasible plan (it prints the reason), fix the model against the meta backend's planning rules — usually with a module patch (step 2.3):
 
-- **Row-parallel projections must be direct outputs.** On the meta device, every q/k/v must be the direct output of its own row-parallel `Linear` (weight `S(1)` → output `S(0)`): the sharded heads that `flash_attn` hard-requires cannot be carried through a windowed view of a fused output — a view inherits a shard only when it covers the sharded axis in full from its start. This is why fused weights are split at load time (step 2.3).
-- **Elementwise products must stay on one axis.** A SwiGLU gate/up product whose inputs come from a *fused* column-parallel output is cross-device (each device holds a different half of the features). Split into separate `gate` / `up` column-parallel projections: each output is `S(0)`, the product stays `S(0)`, and the MLP output projection can run row-parallel (`S(0)` → `P` → AllReduce → `R`).
+- **A view of a sharded tensor inherits no shard** unless it covers the sharded axis in full, starting from its beginning. Consequence: the sharded q/k/v that `flash_attn` requires cannot be read out of a fused QKV output — replace the fused projection with direct row-parallel `Linear`s (weight `S(1)` → output `S(0)`) (e.g. `Flux2FusedQKVProjection`).
+- **Elementwise products must stay on one axis.** A product of two column-parallel (`S(0)`) tensors is cross-device when the halves live on different devices — e.g. a SwiGLU `gate * up` read out of a fused `gate | up` output. Split into separate `gate` / `up` column-parallel projections: each output is `S(0)`, the product stays `S(0)`, and the following row-parallel projection can reduce it (`S(0)` → `P` → AllReduce → `R`).
+- **Concat along a sharded axis is forbidden** by the meta backend. A fused output projection over `[attn; mlp]` inputs cannot stay one `Linear` in sharding mode — split it into two row-parallel projections and add the outputs (linearity of the matmul; e.g. `Flux2FusedAttentionOutput`).
 - **Keep ops in sharded states.** Some algebraic rewrites break planning: `rsqrt` is implemented as `pow(x, -0.5)`, not `1.0f / sqrt(x)` — the scalar-broadcast division would lift the scalar to a replicated tensor, and `R / S(a)` cannot be executed on the meta backend.
-- **Head axes must be divisible by the device count** — `flash_attn` shards along the heads axis.
+- **`flash_attn` shards along the heads axis** — the head count must be divisible by the device count.
 
 ## 5. Ship the model
 

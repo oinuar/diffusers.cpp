@@ -27,7 +27,7 @@ public:
     void visit(Parameter& parameter, std::vector<std::string> path) override;
     void visit(Flux2FusedQKVProjection& to_qkv_mlp_proj, std::vector<std::string> path) override;
     void visit(Flux2FusedAttentionOutput& to_out, std::vector<std::string> path) override;
-    void visit(Flux2FeedForward& feed_forward, std::vector<std::string> path) override;
+    void visit(Flux2FusedLinearIn& linear_in, std::vector<std::string> path) override;
 
     void validate() const;
 

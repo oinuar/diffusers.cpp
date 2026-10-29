@@ -2,7 +2,9 @@
 
 #include "nn/Module.hpp"
 #include "nn/Linear.hpp"
+#include "ggml/Scope.hpp"
 #include "diffusers/models/transformers/flux2/Flux2SwiGLU.hpp"
+#include "diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp"
 
 class Flux2FeedForward : public Module {
 private:
@@ -12,21 +14,21 @@ private:
         float mult,
         int64_t inner_dim,
         bool bias
-    ) {
-        // The reference fuses the gate and up projections into one
-        // Linear (dim -> inner * 2) and chunks its output; the split form
-        // is mathematically identical (row-slicing a projection is the
-        // same projection) but shardable: on the meta device the fused
-        // output cannot be split, because a windowed view of a
-        // column-parallel (S(0)) tensor cannot carry the shard (each
-        // device holds a different half of the features, so the SwiGLU
-        // product would be cross-device). With separate gate/up
-        // projections the meta plans them column-parallel (weight S(1)
-        // -> output S(0)), the SwiGLU product stays S(0), and linear_out
-        // can run row-parallel (weight S(0) + activation S(0) ->
-        // PARTIAL -> AllReduce -> R) instead of fully replicated.
-        modules["linear_in_gate"] = std::make_shared<Linear>(dim, inner_dim, bias);
-        modules["linear_in_up"] = std::make_shared<Linear>(dim, inner_dim, bias);
+    ) :
+        sharded_(Scope::sharded())
+    {
+        if (sharded_) {
+            // Sharding patch: the reference's fused linear_in Linear is
+            // replaced by split gate/up projections (see
+            // Flux2FusedLinearIn), so the reference's chunk of its
+            // output does not apply.
+            modules["linear_in"] = std::make_shared<Flux2FusedLinearIn>(dim, inner_dim, bias);
+        } else {
+            // Reference form: one fused projection over (gate | up)
+            // features; the SwiGLU chunks its output.
+            modules["linear_in"] = std::make_shared<Linear>(dim, inner_dim * 2, bias);
+        }
+
         modules["act_fn"] = std::make_shared<Flux2SwiGLU>();
         modules["linear_out"] = std::make_shared<Linear>(inner_dim, dim_out, bias);
     }
@@ -50,33 +52,32 @@ public:
     }
 
     Tensor forward(Scope scope, Tensor x) {
-        auto linear_in_gate = std::static_pointer_cast<Linear>(modules["linear_in_gate"]);
-        auto linear_in_up = std::static_pointer_cast<Linear>(modules["linear_in_up"]);
+        if (sharded_ != Scope::sharded())
+            throw std::runtime_error(
+                "Flux2FeedForward: built for " + std::string(sharded_ ? "sharded" : "reference") +
+                " execution but the active scope is " + std::string(Scope::sharded() ? "sharded" : "reference"));
+
         auto act_fn = std::static_pointer_cast<Flux2SwiGLU>(modules["act_fn"]);
         auto linear_out = std::static_pointer_cast<Linear>(modules["linear_out"]);
 
-        auto gate = linear_in_gate->forward(scope, x);
-        auto up = linear_in_up->forward(scope, x);
+        if (sharded_) {
+            auto linear_in = std::static_pointer_cast<Flux2FusedLinearIn>(modules["linear_in"]);
 
-        x = act_fn->forward(scope, gate, up);
+            auto [gate, up] = linear_in->forward(scope, x);
+
+            x = act_fn->forward(scope, gate, up);
+        } else {
+            auto linear_in = std::static_pointer_cast<Linear>(modules["linear_in"]);
+
+            x = linear_in->forward(scope, x);
+            x = act_fn->forward(scope, x);
+        }
+
         x = linear_out->forward(scope, x);
 
         return x;
     }
 
-    std::shared_ptr<Linear> linear_in_gate() const {
-        return std::static_pointer_cast<Linear>(modules.at("linear_in_gate"));
-    }
-
-    std::shared_ptr<Linear> linear_in_up() const {
-        return std::static_pointer_cast<Linear>(modules.at("linear_in_up"));
-    }
-
-    std::shared_ptr<Linear> linear_out() const {
-        return std::static_pointer_cast<Linear>(modules.at("linear_out"));
-    }
-
-    void accept(Visitor& visitor, std::vector<std::string> path = {}) override {
-        visitor.visit(*this, std::move(path));
-    }
+private:
+    bool sharded_;
 };

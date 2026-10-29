@@ -93,6 +93,11 @@ public:
 
     virtual ~ShardingRuntime() = default;
 
+    // The sharding runtime plans every tensor across the meta
+    // device's backends, so the sharding-adjusted module graphs apply
+    // for every scope traced through it.
+    bool sharded() const override { return true; }
+
     const std::vector<TraceNode>& nodes() const { return nodes_; }
     const std::vector<ggml_tensor*>& raw_of() const { return raw_of_; }
 

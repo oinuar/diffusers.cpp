@@ -17,15 +17,16 @@ public:
         mlp_hidden_dim_(mlp_hidden_dim),
         mlp_mult_factor_(mlp_mult_factor)
     {
-        // QKV projections + MLP input projection. The diffusers reference
-        // fuses these into one Linear (to_qkv_mlp_proj); we keep them as
-        // separate projections: on the meta device every q/k/v must be the
-        // direct output of its own row-parallel projection (weight S(1) ->
-        // output S(0)), because the heads shard that the meta flash_attn_ext
-        // hard-asserts cannot be carried through a windowed view of a fused
-        // output (a view only inherits a shard when it covers the sharded
-        // axis in full from its start). The math is identical: row-slicing
-        // a projection is the same projection.
+        // Sharding patch for the reference's fused to_qkv_mlp_proj
+        // Linear: the diffusers reference fuses the QKV projections +
+        // MLP input projection into one Linear. On the meta device every
+        // q/k/v must be the direct output of its own row-parallel
+        // projection (weight S(1) -> output S(0)), because the heads
+        // shard that the meta flash_attn_ext hard-asserts cannot be
+        // carried through a windowed view of a fused output (a view
+        // only inherits a shard when it covers the sharded axis in full
+        // from its start). The math is identical: row-slicing a
+        // projection is the same projection.
         //
         // The MLP input projection is likewise split into gate and up:
         // its fused output is fed into Flux2SwiGLU, and the windowed gate/
