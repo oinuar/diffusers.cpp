@@ -14,6 +14,18 @@ public:
     // reference form.
     virtual bool sharded() const { return false; }
 
+    // True when the scope-boundary saves must be copied through host
+    // memory instead of a CPY node of the producing scope's graph.
+    //
+    // The sharding runtime on an all-CPU meta device answers true: the
+    // meta backend treats the meta buffer as a host buffer (every
+    // underlying device is a host), and its graph splitter skips the
+    // nodes that are views of host buffers -- so a CPY node whose
+    // destination (the state cell or the loop state) lives in the
+    // buffer would never run. Such a copy must fall back to a
+    // host-side copy.
+    virtual bool host_copy_saves() const { return false; }
+
     // -------------------------------------------------------------------------
     // Tensor creation / initialization
     // -------------------------------------------------------------------------

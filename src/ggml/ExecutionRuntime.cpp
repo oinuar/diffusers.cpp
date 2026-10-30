@@ -44,6 +44,15 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
 
     auto buft = backend.device().buffer_type();
 
+    // A runtime on which the scope-boundary saves cannot run as CPY
+    // nodes of the scopes' graphs (the all-CPU meta device, see
+    // Runtime::host_copy_saves): such saves are copied through host
+    // memory after every execution of the producing scope. The build
+    // phase makes the same decision (Computation::state / fold): a
+    // save is materialized as a CPY node only when the runtime can
+    // run it.
+    const bool host_copy_saves = sharding != nullptr && sharding->host_copy_saves();
+
     std::vector<ggml_cgraph*> graphs;
     graphs.reserve(desc.scopes.size());
 
@@ -55,8 +64,9 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
     // already recorded there at build time; ggml_build_forward_expand
     // expands it into the graph (the nodes, and the leaves — the
     // bound inputs of this context and the pre-allocated weights /
-    // state tensors). On a non-meta backend the save copies are nodes
-    // of the graph as well.
+    // state tensors). The save copies are nodes of the graph as well,
+    // except for the host-copy fallback (host_copy_saves above), which
+    // keeps them host-side.
     //
     // The graphs must be built BEFORE the meta buffers are allocated:
     // the meta backend is brittle about this order.
@@ -243,9 +253,11 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
             // The graph is a single allocation with multiple computations:
             // compute the SAME graph repeatedly. The loop state is carried
             // by the saves: the body's output is written back into the
-            // loop's state cells after every execution (a node of the
-            // graph on a non-meta backend, a host-side copy on the meta
-            // backend).
+            // loop's state cell on every execution -- by a CPY node of
+            // the graph (in place: the CPY node is a view of the cell, so
+            // the cell's storage in the state buffer is the node's), or
+            // by a host-side copy when the runtime cannot run the node
+            // (host_copy_saves above).
 
             for (r.repeat->iter = 0; r.repeat->iter < r.repeat->count; ++r.repeat->iter) {
                 // The re-bindable inputs: rewritten on every (re-)execution.
@@ -259,11 +271,12 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
                 if (ggml_backend_graph_compute(*backend, gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("run(): ggml_backend_graph_compute failed");
 
-                // Copy feedback tensors.
-                for (const auto& save : r.saves) {
-                    if (save.is_feedback)
-                        copy(save.src, save.dst);
-                }
+                // Copy feedback tensors (the host-copy fallback: the
+                // runtime cannot run the CPY node, see above).
+                if (host_copy_saves)
+                    for (const auto& save : r.saves)
+                        if (save.is_feedback)
+                            copy(save.src, save.dst);
 
                 if (progress)
                     progress->next();
@@ -293,10 +306,12 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
                 progress->pop();
         }
 
-        // Copy state tensors.
-        for (const auto& save : r.saves)
-            if (!save.is_feedback)
-                copy(save.src, save.dst);
+        // Copy state tensors (the host-copy fallback: the runtime
+        // cannot run the CPY node, see above).
+        if (host_copy_saves)
+            for (const auto& save : r.saves)
+                if (!save.is_feedback)
+                    copy(save.src, save.dst);
 
         // The scope is done: free its buffer. Nothing in the scope
         // context leaks outside -- the values that survive are in the
@@ -339,7 +354,9 @@ void ExecutionRuntime::copy(const Tensor& src, const Tensor& dst) const {
     // A tensor in a temporary context is copied into the state context
     // (a save) or back into the loop state of the same graph (a repeat
     // feedback): the value is read from the source tensor and written
-    // into the destination tensor.
+    // into the destination tensor. This is the host-copy fallback for
+    // runtimes that cannot run the save as a CPY node of the graph
+    // (host_copy_saves in run()).
     size_t nbytes = ggml_nbytes(*src);
     std::vector<std::byte> data(nbytes);
     ggml_backend_tensor_get(*src, data.data(), 0, nbytes);

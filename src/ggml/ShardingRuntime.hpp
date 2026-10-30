@@ -98,6 +98,16 @@ public:
     // for every scope traced through it.
     bool sharded() const override { return true; }
 
+    // The meta backend treats the meta buffer as a host buffer when
+    // every underlying device is a CPU: its graph splitter skips the
+    // nodes that are views of host buffers, so a CPY node whose
+    // destination (the state cell or the loop state) lives in the
+    // buffer would never run. The scope-boundary saves must fall back
+    // to host-side copies.
+    bool host_copy_saves() const override {
+        return ggml_backend_buft_is_host(device_.buffer_type());
+    }
+
     const std::vector<TraceNode>& nodes() const { return nodes_; }
     const std::vector<ggml_tensor*>& raw_of() const { return raw_of_; }
 
@@ -404,7 +414,10 @@ public:
         const int di = get_id(dst);
         const int rank = nodes_[di].rank;
         std::vector<Candidate> cands = {{Dist::replicated(), {Dist::replicated(), Dist::replicated()}}};
-        if (nodes_[si].rank <= rank) {
+        // A src fixed to R (a goal root or an externally fixed leaf) has
+        // no sharded production: a sharded candidate would ask the DP to
+        // plan the same tensor in two states, which is infeasible.
+        if (nodes_[si].rank <= rank && !nodes_[si].is_output && !nodes_[si].is_fixed) {
             for (int a = 0; a < nodes_[si].rank; ++a) {
                 if (derive_reshape(nodes_[si].ne, nodes_[di].ne, Dist::shard(a)))
                     cands.push_back({Dist::shard(derive_reshape_axis(nodes_[si].ne, nodes_[di].ne, a)), {Dist::shard(a), Dist::replicated()}});
