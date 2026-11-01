@@ -11,8 +11,6 @@ Two invariants for everything you port:
 1. **Mirror the Python implementation module by module** — class names, structure, formulas, config schemas, tensor names.
 2. **Replace the Python/PyTorch runtime in a few systematic ways** — see [Runtime mapping](#runtime-mapping).
 
-[Flux2KleinPipeline](src/diffusers/pipelines/flux2/Flux2KleinPipeline.hpp) is the complete worked example. A port is **complete** when the single-device and the multi-device paths both work, a quantization config exists for the model, and all tests pass — see [Done](#done).
-
 ## Port flow
 
 1. [Study the Python source code](#1-study-the-python-source-code)
@@ -147,7 +145,7 @@ Translate the Python `forward` line by line with the [tensor operator syntax](#t
 
 1. Add `test/src/<same path as the module>/<ClassName>.py` with a `unittest.TestCase` subclass (see e.g. `test/src/diffusers/models/transformers/flux2/`). Build the class with the smallest config that keeps the real shape structure, generate random weights with a seeded `torch.Generator`, pass them to the C++ CLI via `--param` options (or as quantized raw bytes via `--quant` when testing with a quantization spec), and compare against the Python reference.
 2. Run it: `ctest --test-dir build -j8 --output-on-failure -R "<path-derived name>"`, e.g. `-R "src-diffusers-models-transformers-flux2-MyNorm"`.
-3. If the C++ CLI crashes, the test writes a reproduction Python script to `build/test-repro/` — run it to reproduce the exact failure.
+3. If the C++ CLI crashes or test fails with assertion, the test writes a reproduction Python script to `build/test-repro/` — run it to reproduce the exact failure.
 
 Each test directory is driven by its own CLI: `test/src/ggml/Tensor/` → `test-tensor-cli`, `test/src/nn/` → `test-nn-cli`, `test/src/diffusers/` → `test-diffusers-cli`, `test/src/diffusers/flux2` → `test-flux2-cli`, `test/src/transformers/` → `test-qwen3-cli`.
 
@@ -208,37 +206,53 @@ If the suite is green, go to [step 8](#8-check-the-sharding-plan-is-optimal) and
 
 Read the infeasibility reason the planner printed (it names the op or tensor that cannot be planned, followed by a trace dump) and fix the model against the meta backend's planning rules — usually with a module patch:
 
-- **A view of a sharded tensor inherits no shard** unless it covers the sharded axis in full, starting from its beginning. Consequence: the sharded q/k/v that `flash_attn` requires cannot be read out of a fused QKV output — replace the fused projection with direct row-parallel `Linear`s (weight `S(1)` → output `S(0)`) (e.g. `Flux2FusedQKVProjection`).
-- **Elementwise products must stay on one axis.** A product of two column-parallel (`S(0)`) tensors is cross-device when the halves live on different devices — e.g. a SwiGLU `gate * up` read out of a fused `gate | up` output. Split into separate `gate` / `up` column-parallel projections: each output is `S(0)`, the product stays `S(0)`, and the following row-parallel projection can reduce it (`S(0)` → `P` → AllReduce → `R`).
-- **Concat along a sharded axis is forbidden** by the meta backend. A fused output projection over `[attn; mlp]` inputs cannot stay one `Linear` in sharding mode — split it into two row-parallel projections and add the outputs (linearity of the matmul; e.g. `Flux2FusedAttentionOutput`).
-- **Keep ops in sharded states.** Some algebraic rewrites break planning: `rsqrt` is implemented as `pow(x, -0.5)`, not `1.0f / sqrt(x)` — the scalar-broadcast division would lift the scalar to a replicated tensor, and `R / S(a)` cannot be executed on the meta backend.
-- **`flash_attn` shards along the heads axis** — the head count must be divisible by the device count.
+1. **Locate the offending computation.** The dump lists every traced tensor with its inputs and the candidate states the planner tried — find the named op and walk its input chain back to the module whose `forward` produces it.
+2. **Match it against the [planning rules](#the-meta-backends-planning-rules) below.** A rule tells you *what state the tensor must be in*; the module's structure tells you *where to move the computation* so it is produced in that state. The same rule looks different in different models, so there is no fixed substitution — the restructuring is a per-module decision.
+3. **Apply the restructuring as a [module patch](#module-patches)** — a change that is active only when the graph is traced through a sharding runtime, leaving the 1:1 reference form (step 4) untouched.
+4. **Re-run** `N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure` and repeat until the plan is feasible and the suite is green, then check the plan in [step 8](#8-check-the-sharding-plan-is-optimal).
 
-Re-run `N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure` after each patch; repeat until the plan is feasible and the suite is green, then check the plan in [step 8](#8-check-the-sharding-plan-is-optimal).
+### The meta backend's planning rules
+
+The planner tries only the split states the meta backend accepts; when none survives for a tensor, the graph as drawn is infeasible. These are the common reasons for infeasible plan:
+
+- **A view of a sharded tensor inherits no shard** unless it covers the sharded axis in full, starting from its beginning — a windowed slice of a sharded output is a fresh tensor, so the state it needs must be produced directly, not carved out of the sharded parent.
+- **Elementwise ops keep one axis.** A sharded output requires both real operands sharded along the *same* axis; a size-1 broadcast operand must stay replicated. In particular, a product of two column-parallel (`S(0)`) tensors whose halves live on different devices is cross-device and rejected.
+- **Concat along a sharded axis is forbidden.** For a projection over concatenated inputs, use the linearity of the matmul instead: `W @ [a; b] = W_a @ a + W_b @ b`.
+- **One storage state per tensor.** The meta backend derives exactly one split state per tensor, so a plan that must produce the same tensor in two states is infeasible; some algebraic rewrites silently force this — `rsqrt` is `pow(x, -0.5)`, not `1.0f / sqrt(x)`, because the scalar-broadcast division would lift the scalar to a replicated tensor, and `R / S(a)` cannot run on the meta backend.
+- **`flash_attn` shards along the heads axis** — the head count must be divisible by the device count, and its q/k/v must arrive in that sharded state.
 
 ### Module patches
 
-The reference form of a module stays 1:1 with Python; an adjustment the sharding planner forces (this step) is a **module patch** applied only when the graph is traced through a sharding runtime, never unconditionally. Every current patch splits a fused weight; the pattern generalizes to any adjustment.
+Any restructuring the rules force is applied as a **module patch**: a mode-specific variant of one module, active only when the graph is traced through a sharding runtime, never unconditionally. The reference form stays 1:1 with Python (step 4).
 
-**Two forms under one name.** The patched parent keeps both forms under the same child names, so the module tree and the checkpoint tensor names are Python's in both modes:
+**Two forms under one name.** The patched module builds both forms under the *same child names*, so the module tree and the checkpoint tensor names are Python's in both modes:
 
-- **Reference form (default):** plain `Linear` children, exactly like Python's `nn.Linear` (e.g. `attn.to_qkv_mlp_proj` = `Linear(query_dim, 3·inner + mlp_out)`); `forward` calls them and `split` / `chunk`s their output, mirroring Python line by line. The generic `GGUFLoaderVisitor` traversal loads the fused tensors as-is.
-- **Patch form:** a dedicated patch module holds the split children instead. Examples: [`Flux2FusedQKVProjection`](src/diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp) replaces `to_qkv_mlp_proj` with `q` / `k` / `v` / `mlp_in_gate` / `mlp_in_up` Linears; [`Flux2FusedAttentionOutput`](src/diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp) replaces `to_out` with `attn` / `mlp` Linears; in `Flux2FeedForward` the `linear_in` child is a [`Flux2FusedLinearIn`](src/diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp) with `gate` / `up` Linears instead of a fused `Linear`.
+- **Reference form (default):** the Python children as-is, with a `forward` that mirrors Python line by line. The generic `GGUFLoaderVisitor` traversal loads their tensors as-is.
+- **Patch form:** a dedicated patch module stands in for the child(ren) the restructuring replaces, holding the children the restructured computation needs.
 
-**Mode selection.** `Scope::runtime().use_sharding()` is true only when the active scope is traced through a `ShardingRuntime` (meta backend); it is queryable at construction time (before any scope exists it reports not sharded) and during `forward`. The constructor records it (`sharded_ = Scope::runtime().use_sharding()`), builds the mode-appropriate children, and `forward` branches on the same query, throwing a clear error if the module was built for the other mode.
+**Mode selection.** `Scope::runtime().use_sharding()` is true only when the active scope is traced through a `ShardingRuntime` (the meta backend). The constructor records it — `sharded_ = Scope::active() && Scope::runtime().use_sharding()` (before any scope exists the query reports not sharded) — and builds the mode-appropriate children; `forward` re-checks the same query and throws a clear error if the module was built for the other mode.
 
-**Patch module anatomy** (see the three examples): `Linear` children named after the split projections, with typed accessors; a `forward` that performs the split computation (one GEMM per projection, returned as a tuple); and an `accept()` that always dispatches to the module-specific visit (`visitor.visit(*this, std::move(path))`), never to the generic traversal.
+**Patch module anatomy.** The children the restructured computation needs, with typed accessors; a `forward` that performs the restructured computation; and an `accept()` that always dispatches to the module-specific visit — `visitor.visit(*this, std::move(path))` — never the generic traversal, which would try to load the patch's children by name from a checkpoint that holds only the reference's tensors.
 
-**Loader plumbing** — one overload per patch type, in three places:
+**Loader plumbing.** One visit overload per patch type, in three places:
 
 1. `src/nn/Visitor.hpp` declares the no-op `virtual void visit(<Patch>&, std::vector<std::string>) {}`; `RethrowVisitor` wraps it with `visitWithCatch`.
-2. `GGUFLoaderVisitor` implements it: resolve the fused tensor at the patch's own path (`module_path(path, {}, {"weight"})`), validate its shape, and fill each split child from a slice:
-   - row slices via `read_rows` (rows are contiguous in the file — one seek+read), e.g. `to_qkv_mlp_proj` → `q` / `k` / `v` / `mlp_in_gate` / `mlp_in_up`;
-   - column slices via `read_cols` (one seek+read per row; boundaries must align to the quantization block size so quantized types like Q8_0 slice without dequantization), e.g. `to_out` → `attn` / `mlp`;
-   - a fused 1-D bias is column-sliced as well (`linear_in.bias` → `gate.bias` / `up.bias`).
-3. The test CLI's `CreateParametersVisitor` mirrors the overload: the test still passes the fused tensor under the Python name (`--param-linear_in-weight`) and the visit slices it — F32 rows/cols, or raw quantized bytes (`slice_*_bytes`) when the quantization spec resolves a non-F32 type.
+2. `GGUFLoaderVisitor` implements it: because the patch keeps the reference child's name, it resolves the reference tensor(s) at the patch's own path (e.g. `module_path(path, {}, {"weight"})`), validates their shapes, and fills each child from the part of them the restructured math uses — contiguous row ranges via `read_rows` (rows are contiguous in the file: one seek+read), column ranges via `read_cols` (one seek+read per row; boundaries must align to the quantization block size so quantized types like Q8_0 slice without dequantization), a 1-D bias column-sliced the same way.
+3. The test CLI's `CreateParametersVisitor` mirrors the overload, so tests still pass the reference tensor under its Python name (`--param-<child>-weight`) and the visit slices it — F32 rows/cols, or raw quantized bytes (`slice_*_bytes`) when the quantization spec resolves a non-F32 type.
 
-The split math is identical to the reference — a row or column slice of a projection *is* that projection — so a patch changes where the computation lives, never what it computes. `GGUFLoaderVisitor` may reference only patch modules; every real module loads through the generic traversal.
+The restructured math is identical to the reference — so a patch changes where the computation lives, never what it computes. `GGUFLoaderVisitor` may reference only patch modules; every other module loads through the generic traversal.
+
+### Example: Flux2's fused weights
+
+The Flux2 transformer fuses several projections into single `Linear`s (a single-device memory optimization of the Python reference), and each fusion breaks a different rule above. Each fusion gets one patch module, applied exactly as described:
+
+| Python reference child | Rule it breaks | Patch module: restructured children |
+|---|---|---|
+| `attn.to_qkv_mlp_proj` — one fused `Linear` for q/k/v + the MLP's `gate \| up` input | **view**: the q/k/v chunks of the fused output inherit no shard, so the heads-sharded q/k/v that `flash_attn` requires cannot be read out of it; **elementwise**: the SwiGLU `gate * up` over the fused `gate \| up` output would be a cross-device product | [`Flux2FusedQKVProjection`](src/diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp): `q` / `k` / `v` and `mlp_in_gate` / `mlp_in_up` `Linear`s, column-parallel (weight `S(1)` → output `S(0)`) so each q/k/v is the direct output of its own projection and the SwiGLU product stays `S(0)` |
+| `attn.to_out` — one fused `Linear` over the `[attn; mlp]` concat | **concat** along a sharded axis is forbidden | [`Flux2FusedAttentionOutput`](src/diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp): `attn` / `mlp` row-parallel `Linear`s whose outputs are added (`W @ [a; b] = W_a @ a + W_b @ b`) |
+| `ff.linear_in` — one fused `Linear` for `gate \| up` | **elementwise** (as above) | [`Flux2FusedLinearIn`](src/diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp): `gate` / `up` `Linear`s; each output is `S(0)`, the product stays `S(0)`, so `linear_out` runs row-parallel (`S(0)` → `P` → AllReduce → `R`) |
+
+The loader overloads slice the fused checkpoint tensors the way the reference math splits them — `read_rows` for `to_qkv_mlp_proj` → `q` / `k` / `v` / `mlp_in_gate` / `mlp_in_up` and `linear_in` → `gate` / `up` (plus bias segments), `read_cols` for `to_out` → `attn` / `mlp` — and the test CLIs mirror the same slicing.
 
 ## 8. Check the sharding plan is optimal
 
@@ -299,7 +313,7 @@ A port is **complete** when all of the following hold:
 3. **A quantization config exists** for the model in `utils/convert-model/` (steps 9–10).
 4. **All tests pass** — every unit numerically verified against the pinned Python reference, component by component and end to end.
 
-A pipeline meeting all four is marked **Ported** — see the [status definition in the README](README.md#supported-pipelines).
+A pipeline meeting all four is marked **Ported** [in the README](README.md#supported-pipelines).
 
 ## Reference
 
