@@ -12,10 +12,3 @@ Scope::Scope(Context& context)
     if (!current_runtime_)
         current_runtime_ = &ExecutionRuntime::Default;
 }
-
-bool Scope::sharded() {
-    if (!current_runtime_)
-        return false;
-
-    return current_runtime_->sharded();
-}

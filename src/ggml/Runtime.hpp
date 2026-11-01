@@ -8,23 +8,12 @@ class Runtime {
 public:
     virtual ~Runtime() = default;
 
-    // True when the runtime shards tensors across multiple devices
-    // (meta device): modules built under such a runtime use the
-    // sharding-adjusted form of their graphs instead of the 1:1
-    // reference form.
-    virtual bool sharded() const { return false; }
+    // True when the runtime shards tensors across multiple devices.
+    virtual bool use_sharding() const { return false; }
 
     // True when the scope-boundary saves must be copied through host
-    // memory instead of a CPY node of the producing scope's graph.
-    //
-    // The sharding runtime on an all-CPU meta device answers true: the
-    // meta backend treats the meta buffer as a host buffer (every
-    // underlying device is a host), and its graph splitter skips the
-    // nodes that are views of host buffers -- so a CPY node whose
-    // destination (the state cell or the loop state) lives in the
-    // buffer would never run. Such a copy must fall back to a
-    // host-side copy.
-    virtual bool host_copy_saves() const { return false; }
+    // memory.
+    virtual bool use_host_copy() const { return false; }
 
     // -------------------------------------------------------------------------
     // Tensor creation / initialization

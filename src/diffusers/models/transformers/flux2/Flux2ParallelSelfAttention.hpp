@@ -24,7 +24,7 @@ public:
         float mlp_ratio = 4.0,
         int64_t mlp_mult_factor = 2)
     {
-        sharded_ = Scope::sharded();
+        sharded_ = Scope::active() && Scope::runtime().use_sharding();
 
         head_dim_ = dim_head;
         inner_dim_ = out_dim.value_or(dim_head * heads);
@@ -69,10 +69,10 @@ public:
         std::optional<Tensor> attention_mask = std::nullopt,
         std::optional<std::pair<std::shared_ptr<Flux2PosEmbed>, Tensor>> image_rotary_emb = std::nullopt
     ) {
-        if (sharded_ != Scope::sharded())
+        if (sharded_ != scope.runtime().use_sharding())
             throw std::runtime_error(
-                "Flux2ParallelSelfAttention: built for " + std::string(sharded_ ? "sharded" : "reference") +
-                " execution but the active scope is " + std::string(Scope::sharded() ? "sharded" : "reference"));
+                "Flux2ParallelSelfAttention: built for " + std::string(sharded_ ? "sharded" : "non-sharded") +
+                " execution but the active scope is " + std::string(scope.runtime().use_sharding() ? "sharded" : "non-sharded"));
 
         Tensor query, key, value;
         Tensor mlp_hidden_states;

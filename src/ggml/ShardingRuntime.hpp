@@ -93,20 +93,9 @@ public:
 
     virtual ~ShardingRuntime() = default;
 
-    // The sharding runtime plans every tensor across the meta
-    // device's backends, so the sharding-adjusted module graphs apply
-    // for every scope traced through it.
-    bool sharded() const override { return true; }
+    bool use_sharding() const override;
 
-    // The meta backend treats the meta buffer as a host buffer when
-    // every underlying device is a CPU: its graph splitter skips the
-    // nodes that are views of host buffers, so a CPY node whose
-    // destination (the state cell or the loop state) lives in the
-    // buffer would never run. The scope-boundary saves must fall back
-    // to host-side copies.
-    bool host_copy_saves() const override {
-        return ggml_backend_buft_is_host(device_.buffer_type());
-    }
+    bool use_host_copy() const override;
 
     const std::vector<TraceNode>& nodes() const { return nodes_; }
     const std::vector<ggml_tensor*>& raw_of() const { return raw_of_; }

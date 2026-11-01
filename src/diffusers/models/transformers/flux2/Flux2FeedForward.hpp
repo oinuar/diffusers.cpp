@@ -3,6 +3,7 @@
 #include "nn/Module.hpp"
 #include "nn/Linear.hpp"
 #include "ggml/Scope.hpp"
+#include "ggml/Runtime.hpp"
 #include "diffusers/models/transformers/flux2/Flux2SwiGLU.hpp"
 #include "diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp"
 
@@ -15,7 +16,7 @@ private:
         int64_t inner_dim,
         bool bias
     ) :
-        sharded_(Scope::sharded())
+        sharded_(Scope::active() && Scope::runtime().use_sharding())
     {
         if (sharded_) {
             // Sharding patch: the reference's fused linear_in Linear is
@@ -52,10 +53,10 @@ public:
     }
 
     Tensor forward(Scope scope, Tensor x) {
-        if (sharded_ != Scope::sharded())
+        if (sharded_ != scope.runtime().use_sharding())
             throw std::runtime_error(
-                "Flux2FeedForward: built for " + std::string(sharded_ ? "sharded" : "reference") +
-                " execution but the active scope is " + std::string(Scope::sharded() ? "sharded" : "reference"));
+                "Flux2FeedForward: built for " + std::string(sharded_ ? "sharded" : "non-sharded") +
+                " execution but the active scope is " + std::string(scope.runtime().use_sharding() ? "sharded" : "non-sharded"));
 
         auto act_fn = std::static_pointer_cast<Flux2SwiGLU>(modules["act_fn"]);
         auto linear_out = std::static_pointer_cast<Linear>(modules["linear_out"]);

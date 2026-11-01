@@ -491,16 +491,10 @@ public:
         
         r.outputs = next_values;
 
-        // The feedback saves run as CPY nodes of this graph: every
-        // execution writes the body's output into the loop's state cell
-        // in place (a CPY node is a view of its destination), so no
-        // host copy is needed. A runtime that cannot run such a node
-        // (the all-CPU meta device, see Runtime::host_copy_saves)
-        // skips it: the ExecutionRuntime copies the feedback through
-        // host memory instead.
-        if (!Scope::runtime().host_copy_saves())
+        // Add CPY node if host-copies are not used in Runtime.
+        if (!scope.runtime().use_host_copy())
             for (auto i = 0; i < next_values.size(); ++i)
-                r.outputs.push_back(Tensor(Scope::runtime().cpy(*next_values[i], *curr_values[i])));
+                r.outputs.push_back(Tensor(scope.runtime().cpy(*next_values[i], *curr_values[i]), next_values[i].shape()));
 
         for (auto i = 0; i < next_values.size(); ++i)
             r.saves.push_back({
@@ -552,15 +546,10 @@ private:
         Scope state_scope(desc_->context());
         auto cell = ComputationValue<Tensor>::state(value).name(value.name() + std::string(" (state)"));
 
-        // The save runs as a CPY node of the producing scope's graph:
-        // the node is a view of the cell, so the scope's execution writes
-        // the value into the cell in place, on any backend (no host copy).
-        // A runtime that cannot run such a node (the all-CPU meta
-        // device, see Runtime::host_copy_saves) skips it: the
-        // ExecutionRuntime copies the save through host memory instead.
-        if (!Scope::runtime().host_copy_saves()) {
+        // Add CPY node if host-copies are not used in Runtime.
+        if (!state_scope.runtime().use_host_copy()) {
             Scope producer_scope(*scope->context);
-            scope->outputs.push_back(Tensor(Scope::runtime().cpy(*value, *cell)));
+            scope->outputs.push_back(Tensor(state_scope.runtime().cpy(*value, *cell), value.shape()));
         }
 
         scope->saves.push_back({

@@ -46,12 +46,9 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
 
     // A runtime on which the scope-boundary saves cannot run as CPY
     // nodes of the scopes' graphs (the all-CPU meta device, see
-    // Runtime::host_copy_saves): such saves are copied through host
-    // memory after every execution of the producing scope. The build
-    // phase makes the same decision (Computation::state / fold): a
-    // save is materialized as a CPY node only when the runtime can
-    // run it.
-    const bool host_copy_saves = sharding != nullptr && sharding->host_copy_saves();
+    // Runtime::use_host_copy): such saves are copied through host
+    // memory after every execution of the producing scope.
+    const bool host_copy_saves = sharding != nullptr && sharding->use_host_copy() || use_host_copy();
 
     std::vector<ggml_cgraph*> graphs;
     graphs.reserve(desc.scopes.size());
