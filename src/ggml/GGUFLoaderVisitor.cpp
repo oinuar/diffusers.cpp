@@ -1,6 +1,7 @@
 #include "ggml/GGUFLoaderVisitor.hpp"
 #include "ggml/Context.hpp"
 #include "nn/Parameter.hpp"
+#include "nn/PermutedParameter.hpp"
 #include "nn/ModulePath.hpp"
 #include "diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp"
 #include "diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp"
@@ -92,6 +93,79 @@ static Context::Provider<std::byte> read_cols(
         }
 
         return buf;
+    };
+}
+
+// Reorders the raw bytes of a freshly loaded weight into the MROPE
+// head layout (see PermutedParameter / Flux2PosEmbed):
+//
+//   Rows:     output row j = input row perm[j] -- a pure byte reorder,
+//             exact for every storage type.
+//   Elements: output element j = input element perm[j] within each row
+//             -- a fixed-size element reorder, exact for F32/F16/BF16.
+//
+// The providers are one-shot (weight load), so the buffer is permuted
+// once, right after the read.
+static Context::Provider<std::byte> permute_parameter(
+    const Context::Provider<std::byte>& provider,
+    ggml_type type,
+    int64_t rows,
+    int64_t cols,
+    PermutedParameter::Axis axis,
+    const std::vector<size_t>& perm,
+    const std::string& name)
+{
+    size_t element_bytes = 0;
+
+    if (axis == PermutedParameter::Axis::Elements) {
+        switch (type) {
+            case GGML_TYPE_F32:    element_bytes = 4; break;
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:   element_bytes = 2; break;
+            default:
+                throw std::runtime_error(
+                    "Error while loading Tensor '" + name +
+                    "': MROPE element permutation is not supported for type " +
+                    std::string(ggml_type_name(type)));
+        }
+    }
+
+    return [=](std::mt19937& rng) {
+        auto buf = provider(rng);
+        auto row_bytes = static_cast<size_t>(ggml_row_size(type, cols));
+
+        if (perm.size() != static_cast<size_t>(axis == PermutedParameter::Axis::Rows ? rows : cols))
+            throw std::runtime_error(
+                "Error while loading Tensor '" + name +
+                "': MROPE permutation size mismatch");
+
+        std::vector<std::byte> out(buf.size());
+
+        for (size_t r = 0; r < rows; ++r) {
+            if (axis == PermutedParameter::Axis::Rows) {
+                if (r >= perm.size() || perm[r] >= static_cast<size_t>(rows))
+                    throw std::runtime_error(
+                        "Error while loading Tensor '" + name + "': MROPE permutation out of range");
+
+                std::copy(
+                    buf.begin() + perm[r] * row_bytes,
+                    buf.begin() + (perm[r] + 1) * row_bytes,
+                    out.begin() + r * row_bytes);
+            } else {
+                for (size_t j = 0; j < cols; ++j) {
+                    if (perm[j] >= static_cast<size_t>(cols))
+                        throw std::runtime_error(
+                            "Error while loading Tensor '" + name + "': MROPE permutation out of range");
+
+                    std::copy(
+                        buf.begin() + r * row_bytes + perm[j] * element_bytes,
+                        buf.begin() + r * row_bytes + (perm[j] + 1) * element_bytes,
+                        out.begin() + r * row_bytes + j * element_bytes);
+                }
+            }
+        }
+
+        return out;
     };
 }
 
@@ -211,15 +285,15 @@ GGUFLoaderVisitor::TensorInfo GGUFLoaderVisitor::load_tensor(const std::string& 
     return { type, ne[1], ne[0], offset };
 }
 
-void GGUFLoaderVisitor::visit(Parameter& parameter, std::vector<std::string> path) {
-    ModulePath module_path;
-    auto model_path = module_path(path);
+GGUFLoaderVisitor::TensorBytes GGUFLoaderVisitor::load_tensor_bytes(
+    const std::string& model_path,
+    const Tensor::Shape& parameter_shape)
+{
     auto it = lookup_.find(model_path);
 
     if (it == std::end(lookup_))
         throw std::runtime_error("Error while loading Tensor '" + model_path + "': Tensor not found");
 
-    auto tensor_name = it->first;
     auto tensor_id = it->second;
     lookup_.erase(it);
 
@@ -237,33 +311,31 @@ void GGUFLoaderVisitor::visit(Parameter& parameter, std::vector<std::string> pat
         throw std::runtime_error(
             "GGUF tensor has invalid dimensions");
 
-    auto name = gguf_get_tensor_name(gguf_ctx_, tensor_id);
+    Tensor::Shape gguf_shape(n_dims);
+
+    for (auto r = 0; r < gguf_shape.rank(); ++r)
+        gguf_shape[r] = ne[gguf_shape.rank() - 1 - r];
+
+    if (parameter_shape != gguf_shape)
+        throw std::runtime_error("Error while loading Tensor '" + model_path + "': Parameter shape mismatch: expected " + parameter_shape.to_string() + ", got " + gguf_shape.to_string());
 
     const std::streamoff offs = gguf_get_data_offset(gguf_ctx_) + gguf_get_tensor_offset(gguf_ctx_, tensor_id);
 
-    Tensor::Shape expected_shape(n_dims);
+    // Contiguous storage: a row of the fastest dimension, times the
+    // outer dimensions.
+    auto n_bytes = static_cast<size_t>(ggml_row_size(type, gguf_shape[gguf_shape.rank() - 1]));
 
-    for (auto r = 0; r < expected_shape.rank(); ++r)
-        expected_shape[r] = ne[expected_shape.rank() - 1 - r];
+    for (auto r = 0; r + 1 < gguf_shape.rank(); ++r)
+        n_bytes *= gguf_shape[r];
 
-    if (parameter.shape() != expected_shape)
-        throw std::runtime_error("Error while loading Tensor '" + model_path + "': Parameter shape mismatch: expected " + parameter.shape().to_string() + ", got " + expected_shape.to_string());
-
-    Scope scope(context_);
-    auto tensor = Tensor::empty(expected_shape, type);
-
-    tensor.name(name);
-
-    auto n_bytes = ggml_nbytes(*tensor);
-
-    context_.bind<std::byte>(tensor,
-        [n_bytes, expected_shape, offs, file = file_, model_path = std::move(model_path)](std::mt19937&) {
+    return {
+        type,
+        gguf_get_tensor_name(gguf_ctx_, tensor_id),
+        [n_bytes, offs, file = file_, model_path](std::mt19937&) {
             std::vector<std::byte> buf(n_bytes);
 
-            // std::cerr << "BIND " << tensor_name.c_str() << " " << expected_shape.to_string() << " " << ggml_type_name(type) << std::endl;
-
             file->seekg(offs, file->beg);
-            
+
             if (!*file)
                 throw std::runtime_error("Error while loading Tensor '" + model_path + "': seek failed");
 
@@ -274,9 +346,48 @@ void GGUFLoaderVisitor::visit(Parameter& parameter, std::vector<std::string> pat
                 throw std::runtime_error("Error while loading Tensor '" + model_path + "': read failed");
 
             return buf;
-        }, /*once=*/true);
+        }
+    };
+}
 
-    // std::cerr << "LOAD " << tensor_name.c_str() << " " << expected_shape.to_string() << " " << ggml_type_name(type) << std::endl;
+void GGUFLoaderVisitor::visit(Parameter& parameter, std::vector<std::string> path) {
+    ModulePath module_path;
+    auto load = load_tensor_bytes(module_path(path), parameter.shape());
+
+    Scope scope(context_);
+    auto tensor = Tensor::empty(parameter.shape(), load.type);
+
+    tensor.name(load.name);
+
+    context_.bind<std::byte>(tensor, load.provider, /*once=*/true);
+
+    parameter.set(tensor);
+}
+
+void GGUFLoaderVisitor::visit(PermutedParameter& parameter, std::vector<std::string> path) {
+    ModulePath module_path;
+    auto model_path = module_path(path);
+    auto load = load_tensor_bytes(model_path, parameter.shape());
+
+    auto shape = parameter.shape();
+    auto cols = shape[shape.rank() - 1];
+    auto rows = 1;
+
+    for (auto r = 0; r + 1 < shape.rank(); ++r)
+        rows *= shape[r];
+
+    Scope scope(context_);
+    auto tensor = Tensor::empty(shape, load.type);
+
+    tensor.name(load.name);
+
+    // Load the raw GGUF bytes, then reorder them into the MROPE head
+    // layout (see PermutedParameter).
+    context_.bind<std::byte>(
+        tensor,
+        permute_parameter(load.provider, load.type, rows, cols, parameter.axis(), parameter.perm(), model_path),
+        /*once=*/true);
+
     parameter.set(tensor);
 }
 
@@ -312,11 +423,21 @@ void GGUFLoaderVisitor::visit(Flux2FusedQKVProjection& to_qkv_mlp_proj, std::vec
             Tensor::Shape({3 * inner + mlp_out, query_dim}).to_string() +
             ", got " + Tensor::Shape({weight.rows, weight.cols}).to_string());
 
-    q_weight->set(create_weight(context_, weight_path + "-q-weight", q_weight->shape(), weight.type,
-        read_rows(file_, weight, 0, inner, weight_path + "-q-weight")));
+    // The q/k weights may be PermutedParameters (see Flux2ParallelSelf-
+    // Attention): their rows are permuted into the MROPE head layout at
+    // load time.
+    auto q_provider = read_rows(file_, weight, 0, inner, weight_path + "-q-weight");
+    auto k_provider = read_rows(file_, weight, inner, 2 * inner, weight_path + "-k-weight");
 
-    k_weight->set(create_weight(context_, weight_path + "-k-weight", k_weight->shape(), weight.type,
-        read_rows(file_, weight, inner, 2 * inner, weight_path + "-k-weight")));
+    if (auto q_mrope = std::dynamic_pointer_cast<PermutedParameter>(q_weight))
+        q_provider = permute_parameter(q_provider, weight.type, inner, query_dim, q_mrope->axis(), q_mrope->perm(), weight_path + "-q-weight");
+
+    if (auto k_mrope = std::dynamic_pointer_cast<PermutedParameter>(k_weight))
+        k_provider = permute_parameter(k_provider, weight.type, inner, query_dim, k_mrope->axis(), k_mrope->perm(), weight_path + "-k-weight");
+
+    q_weight->set(create_weight(context_, weight_path + "-q-weight", q_weight->shape(), weight.type, q_provider));
+
+    k_weight->set(create_weight(context_, weight_path + "-k-weight", k_weight->shape(), weight.type, k_provider));
 
     v_weight->set(create_weight(context_, weight_path + "-v-weight", v_weight->shape(), weight.type,
         read_rows(file_, weight, 2 * inner, 3 * inner, weight_path + "-v-weight")));

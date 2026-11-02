@@ -4,7 +4,9 @@
 #include "nn/Visitor.hpp"
 #include "ggml/Tensor.hpp"
 #include "ggml/Runtime.hpp"
+#include <cstddef>
 #include <optional>
+#include <vector>
 
 class Parameter : public Module {
 public:

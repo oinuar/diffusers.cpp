@@ -701,6 +701,37 @@ public:
         return traced("rope", inputs, std::move(cands), at.rank, at.ne, out);
     }
 
+    ggml_tensor* rope_multi(ggml_tensor* a, ggml_tensor* b, ggml_tensor* c,
+                            int n_dims, int sections[GGML_MROPE_SECTIONS], int mode, int n_ctx_orig,
+                            float freq_base, float freq_scale, float ext_factor,
+                            float attn_factor, float beta_fast, float beta_slow) override {
+        // Same GGML_OP_ROPE meta rule as rope_ext (handle_rope): the
+        // position src b must be MIRRORED (hard assert); a's state
+        // carries over unchanged; c (per-pair frequency factors) is a
+        // small value tensor and only a replicated one is planned.
+        ggml_tensor* out = parent_.rope_multi(a, b, c, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        const int ai = get_id(a);
+        const TraceNode& at = nodes_[ai];
+        const bool has_c = c != nullptr;
+
+        std::vector<int> inputs = {ai, get_id(b)};
+        if (has_c)
+            inputs.push_back(get_id(c));
+
+        std::vector<Candidate> cands;
+        {
+            std::vector<Dist> ins = {Dist::replicated(), Dist::replicated()};
+            if (has_c) ins.push_back(Dist::replicated());
+            cands.push_back({Dist::replicated(), std::move(ins)});
+        }
+        for (int ax = 0; ax < at.rank; ++ax) {
+            std::vector<Dist> ins = {Dist::shard(ax), Dist::replicated()};
+            if (has_c) ins.push_back(Dist::replicated());
+            cands.push_back({Dist::shard(ax), std::move(ins)});
+        }
+        return traced("rope", inputs, std::move(cands), at.rank, at.ne, out);
+    }
+
 private:
     // ---------------------------------------------------------------------
     // Candidate generation -- exactly the states the meta backend accepts

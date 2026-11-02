@@ -6,7 +6,9 @@
 class RMSNorm : public Module {
 public:
     // GGML supports only last dimension reduction norm
-    RMSNorm(int64_t dim, float eps = 1e-5f, bool elementwise_affine = true);
+    // weight: optional pre-built weight parameter (e.g. an
+    // PermutedParameter); a plain Parameter is created when null.
+    RMSNorm(int64_t dim, float eps = 1e-5f, bool elementwise_affine = true, std::shared_ptr<Parameter> weight = nullptr);
 
     Tensor forward(Scope scope, Tensor x);
 

@@ -39,12 +39,26 @@ public:
         mlp_hidden_dim_ = int(query_dim * mlp_ratio_);
         mlp_mult_factor_ = mlp_mult_factor;
 
+        //
+        // MROPE head layout (see Flux2PosEmbed): the q/k projections
+        // and the QK-norm weights are PermutedParameters -- the loader
+        // permutes them into the ggml MROPE (NEOX) layout once at load
+        // time, so attention runs the whole head dimension through one
+        // MROPE op. v, the MLP part and the output projections stay in
+        // the original layout (the attention output is invariant under
+        // the same permutation of q and k).
+        //
+        auto head_perm = Flux2PosEmbed::mrope_permutation(head_dim_, heads_);
+
         // Fused QKV projections + MLP input projection
         if (sharded_) {
             // Sharding patch: the reference's fused Linear is replaced
             // by split-projection modules (see Flux2FusedQKVProjection
             // / Flux2FusedAttentionOutput).
-            modules["to_qkv_mlp_proj"] = std::make_shared<Flux2FusedQKVProjection>(query_dim_, inner_dim_, mlp_hidden_dim_, mlp_mult_factor, bias);
+            modules["to_qkv_mlp_proj"] = std::make_shared<Flux2FusedQKVProjection>(
+                query_dim_, inner_dim_, mlp_hidden_dim_, mlp_mult_factor, bias,
+                std::make_shared<PermutedParameter>(Tensor::Shape({inner_dim_, query_dim_}), PermutedParameter::Axis::Rows, head_perm),
+                std::make_shared<PermutedParameter>(Tensor::Shape({inner_dim_, query_dim_}), PermutedParameter::Axis::Rows, head_perm));
             modules["to_out"] = std::make_shared<Flux2FusedAttentionOutput>(inner_dim_, mlp_hidden_dim_, out_dim_, out_bias);
         } else {
             // Reference form: the reference fuses the QKV + MLP input
@@ -52,15 +66,31 @@ public:
             // MLP output projections into another.
             auto mlp_out = static_cast<int64_t>(mlp_hidden_dim_ * mlp_mult_factor_);
 
-            modules["to_qkv_mlp_proj"] = std::make_shared<Linear>(query_dim_, 3 * inner_dim_ + mlp_out, bias);
+            // MROPE row permutation over the fused projection rows:
+            // the q and k row blocks get the per-head P, the v block
+            // and the MLP rows are identity.
+            std::vector<size_t> qkv_mlp_perm(3 * inner_dim_ + mlp_out);
+
+            for (int64_t r = 0; r < inner_dim_; ++r) {
+                qkv_mlp_perm[r] = head_perm[r];
+                qkv_mlp_perm[inner_dim_ + r] = inner_dim_ + head_perm[r];
+            }
+
+            for (int64_t r = 2 * inner_dim_; r < 3 * inner_dim_ + mlp_out; ++r)
+                qkv_mlp_perm[r] = r;
+
+            modules["to_qkv_mlp_proj"] = std::make_shared<Linear>(query_dim_, 3 * inner_dim_ + mlp_out, bias,
+                std::make_shared<PermutedParameter>(Tensor::Shape({3 * inner_dim_ + mlp_out, query_dim_}), PermutedParameter::Axis::Rows, qkv_mlp_perm));
             modules["to_out"] = std::make_shared<Linear>(inner_dim_ + mlp_hidden_dim_, out_dim_, out_bias);
         }
 
         modules["mlp_act_fn"] = std::make_shared<Flux2SwiGLU>();
 
         // QK Norm
-        modules["norm_q"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine);
-        modules["norm_k"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine);
+        modules["norm_q"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine,
+            std::make_shared<PermutedParameter>(Tensor::Shape({dim_head}), PermutedParameter::Axis::Elements, Flux2PosEmbed::mrope_permutation(head_dim_)));
+        modules["norm_k"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine,
+            std::make_shared<PermutedParameter>(Tensor::Shape({dim_head}), PermutedParameter::Axis::Elements, Flux2PosEmbed::mrope_permutation(head_dim_)));
     }
 
     Tensor forward(

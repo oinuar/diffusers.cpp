@@ -5,10 +5,11 @@
 Linear::Linear(
     int64_t in_features,
     int64_t out_features,
-    bool bias
+    bool bias,
+    std::shared_ptr<Parameter> weight
 ) : bias_(bias)
 {
-    modules["weight"] = std::make_shared<Parameter>(Tensor::Shape({out_features, in_features}));
+    modules["weight"] = weight ? std::move(weight) : std::make_shared<Parameter>(Tensor::Shape({out_features, in_features}));
 
     if (bias_)
         modules["bias"] = std::make_shared<Parameter>(Tensor::Shape({out_features}));

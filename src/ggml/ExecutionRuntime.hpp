@@ -314,6 +314,21 @@ public:
         float beta_fast,
         float beta_slow) override;
 
+    ggml_tensor* rope_multi(
+        ggml_tensor* a,
+        ggml_tensor* b,
+        ggml_tensor* c,
+        int n_dims,
+        int sections[GGML_MROPE_SECTIONS],
+        int mode,
+        int n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) override;
+
     ggml_tensor* pool_2d(
         ggml_tensor* a,
         ggml_op_pool op,

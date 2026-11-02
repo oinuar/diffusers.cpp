@@ -8,14 +8,20 @@
 #include "nn/Visitor.hpp"
 
 class Parameter;
+class PermutedParameter;
 class Module;
-class Flux2FusedLinearIn;
 
 class RethrowVisitor : public Visitor {
 public:
     explicit RethrowVisitor(Visitor& parent) : parent_(parent) {}
 
     void visit(Parameter& parameter, std::vector<std::string> path) override {
+        visitWithCatch([&] {
+            parent_.visit(parameter, std::move(path));
+        });
+    }
+
+    void visit(PermutedParameter& parameter, std::vector<std::string> path) override {
         visitWithCatch([&] {
             parent_.visit(parameter, std::move(path));
         });

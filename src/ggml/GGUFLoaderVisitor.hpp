@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nn/Visitor.hpp"
+#include "ggml/Context.hpp"
 #include <unordered_map>
 #include <string>
 #include <fstream>
@@ -9,6 +10,8 @@
 #include <gguf.h>
 
 class Context;
+class Parameter;
+class PermutedParameter;
 
 class GGUFLoaderVisitor : public Visitor {
 public:
@@ -25,6 +28,7 @@ public:
     ~GGUFLoaderVisitor();
 
     void visit(Parameter& parameter, std::vector<std::string> path) override;
+    void visit(PermutedParameter& parameter, std::vector<std::string> path) override;
     void visit(Flux2FusedQKVProjection& to_qkv_mlp_proj, std::vector<std::string> path) override;
     void visit(Flux2FusedAttentionOutput& to_out, std::vector<std::string> path) override;
     void visit(Flux2FusedLinearIn& linear_in, std::vector<std::string> path) override;
@@ -40,6 +44,19 @@ private:
     // its raw bytes live in the GGUF file. The tensor is removed from
     // lookup_ so that validate() can report tensors that were not loaded.
     TensorInfo load_tensor(const std::string& name);
+
+    // Looks up the tensor by its dotted module path, checks it against
+    // the expected shape and returns its GGUF type, its name in the
+    // file and a one-shot provider for its raw bytes. The tensor is
+    // removed from lookup_ so that validate() can report tensors that
+    // were not loaded.
+    struct TensorBytes {
+        ggml_type type;
+        std::string name;
+        Context::Provider<std::byte> provider;
+    };
+
+    TensorBytes load_tensor_bytes(const std::string& model_path, const Tensor::Shape& expected_shape);
 
     Context& context_;
     gguf_context* gguf_ctx_;

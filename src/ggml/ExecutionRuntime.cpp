@@ -113,7 +113,7 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
                 total_sharded_bytes += bytes;
         }
 
-        std::cerr << "Total traced tensor memory (sum, not peak): "
+        std::cerr << "Total tensor throughput: "
                   << format_bytes(total_sharded_bytes)
                   << " (sharded) + "
                   << format_bytes(total_replicated_bytes)
@@ -143,10 +143,6 @@ void ExecutionRuntime::run(Backend& backend, std::mt19937& rng, ComputationDescr
         desc.state->allocate(buft, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         print_buffer(backend.device(), desc.state->allocated_size(), " (compute)");
     }
-
-    //for (auto& r : desc.scopes)
-        //if (r.context)
-            //r.context->allocate(buft, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
     if (progress)
         progress->push("Executing", desc.scopes.size());
@@ -781,6 +777,24 @@ ggml_tensor* ExecutionRuntime::rope_ext(
     float beta_slow) 
 {
     return ggml_rope_ext(*Scope::context(), a, b, c, n_dims, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+}
+
+ggml_tensor* ExecutionRuntime::rope_multi(
+    ggml_tensor* a,
+    ggml_tensor* b,
+    ggml_tensor* c,
+    int n_dims,
+    int sections[GGML_MROPE_SECTIONS],
+    int mode,
+    int n_ctx_orig,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow)
+{
+    return ggml_rope_multi(*Scope::context(), a, b, c, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 }
 
 ggml_tensor* ExecutionRuntime::pool_2d(

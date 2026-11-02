@@ -159,13 +159,13 @@ Tensor Flux2Transformer2DModel::forward(
     if (txt_ids.ndim() == 3)
         txt_ids = txt_ids[0];
 
-    // This is different from Python implementation because we'll compute RoPE directly using position IDs,
-    // so embeddings setup is like this:
+    // The rotary embedding is a single MROPE op over the whole head
+    // dimension (see Flux2PosEmbed): its position ids are the four MROPE
+    // position blocks as one (4, Nt + Ni) tensor:
+    // [Nt, 4] + [Ni, 4] -> [Nt + Ni, 4] -> [4, Nt + Ni]
     auto concat_rotary_emb = std::make_pair(
         std::static_pointer_cast<Flux2PosEmbed>(modules["pos_embed"]),
-
-        // [Nt, 4] + [Ni, 4] -> [Nt + Ni, 4]
-        Tensor::cat({txt_ids, img_ids}, 0)
+        Tensor::cat({txt_ids, img_ids}, 0).transpose(0, 1).contiguous()
     );
 
     // TODO: 4. Build joint_attention_kwargs with KV cache info

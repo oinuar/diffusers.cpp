@@ -17,6 +17,57 @@ import numpy as np
 from PIL import Image
 from utils import TestCase
 
+def _mrope_p(head_dim):
+    # The MROPE (NEOX) layout position p holds the original (adjacent)
+    # head-dim position P(p).
+    p = torch.arange(head_dim)
+    return torch.where(p < head_dim // 2, 2 * p, 2 * (p - head_dim // 2) + 1)
+
+def _mrope_permute_rows(w, heads, head_dim):
+    # The C++ attention module stores the q/k projection weights in the
+    # MROPE head layout: new row (h, p) = old row (h, P(p)).
+    P = _mrope_p(head_dim)
+    old = (torch.arange(heads).unsqueeze(1) * head_dim + P.unsqueeze(0)).flatten()
+    w.data = w.data[old]
+
+def _mrope_permute_fused_qkv_rows(w, heads, head_dim):
+    # Same, for the fused qkv+mlp projection: only the q and k row
+    # blocks (the first two head blocks) are permuted, v and the MLP
+    # rows keep the original layout.
+    P = _mrope_p(head_dim)
+    inner = heads * head_dim
+    old = (torch.arange(heads).unsqueeze(1) * head_dim + P.unsqueeze(0)).flatten()
+    idx = torch.arange(w.shape[0])
+    idx[:inner] = old
+    idx[inner:2 * inner] = inner + old
+    w.data = w.data[idx]
+
+def _mrope_permute_transformer_weights(model, heads, head_dim):
+    # The C++ module runs one MROPE op over the whole head dimension, so
+    # its q/k projections and QK norms are pre-permuted into the MROPE
+    # head layout at load time (see PermutedParameter). The test CLI binds
+    # PermutedParameter values as-is, so apply the permutation to the
+    # serialized weights. The Python reference must be evaluated
+    # *before* this: per-axis rope in the original layout satisfies
+    # MROPE(P q) == P(per_axis(q)), and the attention output, built
+    # from the unpermuted v, stays in the original layout.
+    for block in model.transformer_blocks:
+        attn = block.attn
+        _mrope_permute_rows(attn.to_q.weight, heads, head_dim)
+        _mrope_permute_rows(attn.to_k.weight, heads, head_dim)
+        _mrope_permute_rows(attn.add_q_proj.weight, heads, head_dim)
+        _mrope_permute_rows(attn.add_k_proj.weight, heads, head_dim)
+        attn.norm_q.weight.data = attn.norm_q.weight.data[_mrope_p(head_dim)]
+        attn.norm_k.weight.data = attn.norm_k.weight.data[_mrope_p(head_dim)]
+        attn.norm_added_q.weight.data = attn.norm_added_q.weight.data[_mrope_p(head_dim)]
+        attn.norm_added_k.weight.data = attn.norm_added_k.weight.data[_mrope_p(head_dim)]
+
+    for block in model.single_transformer_blocks:
+        attn = block.attn
+        _mrope_permute_fused_qkv_rows(attn.to_qkv_mlp_proj.weight, heads, head_dim)
+        attn.norm_q.weight.data = attn.norm_q.weight.data[_mrope_p(head_dim)]
+        attn.norm_k.weight.data = attn.norm_k.weight.data[_mrope_p(head_dim)]
+
 class TestPipelinesFlux2KleinPipeline(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -446,6 +497,11 @@ class TestPipelinesFlux2KleinPipeline(TestCase):
             return_dict=False,
         )[0]
 
+        # Re-permute the transformer's q/k weights into the MROPE head
+        # layout for the CLI (the reference above used the original
+        # layout -- see _mrope_permute_transformer_weights).
+        _mrope_permute_transformer_weights(pipe.transformer, 2, 40)
+
         actual = self.cli(
             "Flux2KleinPipeline_denoise",
 
@@ -679,6 +735,11 @@ class TestPipelinesFlux2KleinPipeline(TestCase):
             init_latents,
             return_dict=False,
         )[0]
+
+        # Re-permute the transformer's q/k weights into the MROPE head
+        # layout for the CLI (the reference above used the original
+        # layout -- see _mrope_permute_transformer_weights).
+        _mrope_permute_transformer_weights(pipe.transformer, 2, 40)
 
         actual = self.cli(
             "Flux2KleinPipeline_denoise",
@@ -986,12 +1047,6 @@ class TestPipelinesFlux2KleinPipeline(TestCase):
             dtype=torch.float32,
         )
 
-        # Quantize the parameters the same way utils/convert-model does and
-        # run the Python reference with the dequantized weights, so that
-        # both sides compute with exactly the same values.
-        transformer_args = self.params(transformer, self.tmpdir.name, "transformer")
-        vae_args = self.params(vae, self.tmpdir.name, "vae")
-        text_encoder_args = self.params(text_encoder, self.tmpdir.name, "text_encoder")
 
         output = pipe(
             prompt=prompt,
@@ -1002,6 +1057,15 @@ class TestPipelinesFlux2KleinPipeline(TestCase):
             max_sequence_length=max_sequence_length,
             latents=init_latents,
         )
+        # Re-permute the transformer's q/k weights into the MROPE head
+        # layout for the CLI (the reference above used the original
+        # layout -- see _mrope_permute_transformer_weights).
+        _mrope_permute_transformer_weights(transformer, 2, 32)
+
+        transformer_args = self.params(transformer, self.tmpdir.name, "transformer")
+        vae_args = self.params(vae, self.tmpdir.name, "vae")
+        text_encoder_args = self.params(text_encoder, self.tmpdir.name, "text_encoder")
+
 
         expected = [
             torch.from_numpy(np.array(image)).float()

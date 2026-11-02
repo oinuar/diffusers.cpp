@@ -10,7 +10,9 @@ public:
         int64_t inner_dim,
         int64_t mlp_hidden_dim,
         float mlp_mult_factor,
-        bool bias)
+        bool bias,
+        std::shared_ptr<Parameter> q_weight = nullptr,
+        std::shared_ptr<Parameter> k_weight = nullptr)
         :
         query_dim_(query_dim),
         inner_dim_(inner_dim),
@@ -37,8 +39,8 @@ public:
         // (weight S(1) -> output S(0)), the product stays S(0), and the
         // MLP output projection can run row-parallel (weight S(0) +
         // activation S(0) -> PARTIAL -> AllReduce -> R).
-        modules["q"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias);
-        modules["k"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias);
+        modules["q"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias, q_weight);
+        modules["k"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias, k_weight);
         modules["v"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias);
         modules["mlp_in_gate"] = std::make_shared<Linear>(query_dim_, mlp_hidden_dim_, bias);
         modules["mlp_in_up"] = std::make_shared<Linear>(query_dim_, mlp_hidden_dim_, bias);
