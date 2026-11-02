@@ -256,7 +256,7 @@ The loader overloads slice the fused checkpoint tensors the way the reference ma
 
 ## 8. Check the sharding plan is optimal
 
-A feasible plan is not automatically a good one. Every sharded run prints the plan to stderr — inspect a passing run with `N_DEVICES=2 ctest --test-dir build -V -R "<name>"`, or run the test's CLI binary directly:
+A feasible plan is not automatically a good one. Every sharded run prints the plan to stderr — inspect a passing run with `VERBOSE=true N_DEVICES=2 ctest --test-dir build -V -R "<name>"`, or run the test's CLI binary directly:
 
 ```
 === plan (total cost 1234) ===

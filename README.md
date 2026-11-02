@@ -19,8 +19,10 @@ Every ported pipeline is a faithful port — it mirrors the Python diffusers arc
 | Pipeline | Status | Components |
 |----------|--------|------|
 | [Flux2KleinPipeline](src/diffusers/pipelines/flux2/Flux2KleinPipeline.hpp) | Ported | [Flux2Transformer2DModel](src/diffusers/models/transformers/flux2/Flux2Transformer2DModel.hpp), [Qwen3ForCausalLM](src/transformers/models/qwen3/Qwen3ForCausalLM.hpp), [AutoencoderKLFlux2](src/diffusers/models/autoencoders/AutoencoderKLFlux2.hpp), [Qwen2TokenizerFast](src/transformers/models/qwen2/Qwen2TokenizerFast.hpp) |
+| Qwen Image 2.1 | Planned | — |
+| Flux 3 | Planned | — |
 | Ideogram 4.0 | Planned | — |
-| Wan 2.2 | Planned | — |
+| MiniMax H3 | Planned | — |
 
 A pipeline is **Ported** when: all required modules are ported; each is numerically verified against the Python reference, component by component and end to end; a feasible multi-device sharding plan exists (the test suite passes with `N_DEVICES=2`); and a quantization config ships for the model.
 
