@@ -11,7 +11,7 @@ Two invariants for everything you port:
 1. **Mirror the Python implementation module by module** — class names, structure, formulas, config schemas, tensor names.
 2. **Replace the Python/PyTorch runtime in a few systematic ways** — see [Runtime mapping](#runtime-mapping).
 
-## Port flow
+## Workflow
 
 1. [Study the Python source code](#1-study-the-python-source-code)
 2. [Analyze what is already implemented in C++](#2-analyze-what-is-already-implemented-in-c)
@@ -20,11 +20,11 @@ Two invariants for everything you port:
 5. [Check the single-device suite passes (N_DEVICES=1)](#5-check-the-single-device-suite-passes)
 6. [Run the sharded multi-device path (N_DEVICES=2)](#6-run-the-sharded-multi-device-path)
 7. [Plan the sharded path, if the plan is infeasible](#7-plan-the-sharded-path-if-the-plan-is-infeasible)
-8. [Check the sharding plan is optimal](#8-check-the-sharding-plan-is-optimal)
+8. [Optimize the port](#8-optimize-the-port)
 9. [Analyze the quantization](#9-analyze-the-quantization)
 10. [Write the quantization config](#10-write-the-quantization-config)
 
-Steps 1–3 are reading and planning; step 4 is the port proper, worked bottom-up: **tensor ops → modules → pipeline**; steps 5–8 turn it into a working, optimized multi-device port; steps 9–10 make it shippable. Every implementation step ends with a test command — a unit is done when that command is green.
+Steps 1–3 are reading and planning; step 4 is the port proper, worked bottom-up: **tensor ops → modules → pipeline**; steps 5–7 get the port working on one and two devices; step 8 optimizes the working port; steps 9–10 make it shippable. Every implementation step ends with a test command — a unit is done when that command is green.
 
 ## Layout
 
@@ -38,7 +38,7 @@ Steps 1–3 are reading and planning; step 4 is the port proper, worked bottom-u
 | Ported pipelines | `src/diffusers/pipelines/` |
 | Cross-check tests (mirror the source paths) | `test/src/` |
 | Test CLIs | `test/utils/` |
-| Quantization quality measurement | `test/utils/quant_quality.py` |
+| Quantization spec grammar + quant/dequant round-trip helpers | `test/utils/__init__.py` |
 | Model conversion and quantization configs | `utils/convert-model/` |
 
 ## 1. Study the Python source code
@@ -131,7 +131,6 @@ private:
 - **Class name = Python class name.** The model must be constructible from the same upstream `config.json` schema (`Config::from_file`), so keep the config fields and their defaults.
 - **Child names define the tensor-name path.** The `modules` map key is the Python attribute name; the dotted path (e.g. `transformer_blocks.0.attn.q.weight`) is how the GGUF loader matches parameters — keep it identical to upstream.
 - **`Parameter` holds a declared shape and dtype — no data.** Data is bound at load time by the visitor; a ported model is therefore fully constructible from config before any weights exist.
-- **Weight loading is free.** `from_pretrained` walks the module tree with `GGUFLoaderVisitor`, which resolves each `Parameter` by name (a split `Parameter` resolves through its [split configuration](#module-patches) from the fused tensor it slices), validates its shape, and streams the bytes from the component's `model.gguf`. No per-module loading code.
 
 #### 4.2.2 Implement `forward`
 
@@ -143,7 +142,7 @@ Translate the Python `forward` line by line with the [tensor operator syntax](#t
 
 #### 4.2.3 Test it
 
-1. Add `test/src/<same path as the module>/<ClassName>.py` with a `unittest.TestCase` subclass (see e.g. `test/src/diffusers/models/transformers/flux2/`). Build the class with the smallest config that keeps the real shape structure, generate random weights with a seeded `torch.Generator`, pass them to the C++ CLI via `--param` options (or as quantized raw bytes via `--quant` when testing with a quantization spec), and compare against the Python reference.
+1. Add `test/src/<same path as the module>/<ClassName>.py` with a `unittest.TestCase` subclass (see e.g. `test/src/diffusers/models/transformers/flux2/`). Build the class with the smallest config that keeps the real shape structure, generate random weights with `torch.Generator`, pass them to the C++ CLI via `--param` options, and compare against the Python reference.
 2. Run it: `ctest --test-dir build -j8 --output-on-failure -R "<path-derived name>"`, e.g. `-R "src-diffusers-models-transformers-flux2-MyNorm"`.
 3. If the C++ CLI crashes or test fails with assertion, the test writes a reproduction Python script to `build/test-repro/` — run it to reproduce the exact failure.
 
@@ -164,8 +163,8 @@ The pipeline class holds the same components as the Python one. `from_pretrained
 - Map the numbered steps of Python's `__call__` one to one; keep the numbered step comments.
 - `operator()` takes one `Context` per component plus a `GenerationOptions` struct that mirrors the `__call__` arguments (with the Python defaults) and **returns a `Computation<Tensor>`** — it builds the graph, it does not run it.
 - Use `computation.scope(...)` for per-step sub-graphs; random noise comes from `computation.state(...)` with `std::mt19937` (a different RNG stream than torch — deterministic runs and tests pass random values as arguments instead).
-- The eager denoising loop becomes a `fold` over a precomputed `Schedule` held in a `std::shared_ptr` (the computation executes lazily, so the schedule must outlive the construction).
-- Public Python methods (`encode_prompt`, `prepare_image_latents`, …) become same-named pipeline methods that build their part of the graph.
+- The eager loops become a `fold` over a state held in a `std::shared_ptr` (the computation executes lazily, so the schedule must outlive the construction).
+- Public Python methods (e.g. `encode_prompt`, `prepare_image_latents`, …) become same-named pipeline methods that build their part of the graph.
 
 #### 4.3.3 Decide what to drop
 
@@ -174,7 +173,7 @@ Port the core inference path and drop the Python surface the C++ runtime cannot 
 #### 4.3.4 Test it
 
 1. Test the pipeline's public methods first (one test each: prompt encoding, image encoding, one denoising step, decoding, the latent pack/unpack helpers), exactly like the module tests.
-2. Then add the end-to-end `test_call` with a config in the real model's shape class: feed the same `init_latents` to both sides (noise is not comparable across RNGs) and compare the decoded pixels — exact (`rtol=1e-4`) for dequantized weights, or a small pixel tolerance (e.g. 2.5/255) when running with the quantization config.
+2. Then add the end-to-end `test_call` with a config in the real model's shape class.
 
 ## 5. Check the single-device suite passes
 
@@ -196,11 +195,10 @@ N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure
 
 What to expect:
 
-- Every sharded run prints the allocation plan to stderr (the format is described in [step 8](#8-check-the-sharding-plan-is-optimal)).
+- Every sharded run prints the allocation plan to stderr (the format is described in [step 8](#check-the-sharding-plan-is-optimal)).
 - An infeasible plan makes the run throw `run(): the allocation plan is infeasible: <reason>` plus a trace dump, and the test fails.
-- A few tests are single-device only (e.g. the raw `flash_attn` kernel path) and skip themselves when `N_DEVICES > 1` — a skip is not a failure.
 
-If the suite is green, go to [step 8](#8-check-the-sharding-plan-is-optimal) and check that the plan is optimal. If it fails with an infeasible plan, go to [step 7](#7-plan-the-sharded-path-if-the-plan-is-infeasible).
+If the suite is green, go to [step 8](#8-optimizations): check the sharding plan is optimal, then apply the graph optimizations. If it fails with an infeasible plan, go to [step 7](#7-plan-the-sharded-path-if-the-plan-is-infeasible).
 
 ## 7. Plan the sharded path, if the plan is infeasible
 
@@ -209,9 +207,9 @@ Read the infeasibility reason the planner printed (it names the op or tensor tha
 1. **Locate the offending computation.** The dump lists every traced tensor with its inputs and the candidate states the planner tried — find the named op and walk its input chain back to the module whose `forward` produces it.
 2. **Match it against the [planning rules](#the-meta-backends-planning-rules) below.** A rule tells you *what state the tensor must be in*; the module's structure tells you *where to move the computation* so it is produced in that state. The same rule looks different in different models, so there is no fixed substitution — the restructuring is a per-module decision.
 3. **Apply the restructuring as a [module patch](#module-patches)** — a change that is active only when the graph is traced through a sharding runtime, leaving the 1:1 reference form (step 4) untouched.
-4. **Re-run** `N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure` and repeat until the plan is feasible and the suite is green, then check the plan in [step 8](#8-check-the-sharding-plan-is-optimal).
+4. **Re-run** `N_DEVICES=2 ctest --test-dir build -j8 --output-on-failure` and repeat until the plan is feasible and the suite is green, then move on to [step 8](#8-optimizations).
 
-### The meta backend's planning rules
+### The meta backend's planning rules implemented by ShardingRuntime
 
 The planner tries only the split states the meta backend accepts; when none survives for a tensor, the graph as drawn is infeasible. These are the common reasons for infeasible plan:
 
@@ -223,45 +221,34 @@ The planner tries only the split states the meta backend accepts; when none surv
 
 ### Module patches
 
-Any restructuring the rules force is applied as a **module patch**: a mode-specific variant of one module, active only when the graph is traced through a sharding runtime, never unconditionally. The reference form stays 1:1 with Python (step 4).
-
-**Two forms under one name.** The patch is built in the module's constructor and `forward` branches on the same query:
-
-- **Reference form (default):** the Python children as-is, with a `forward` that mirrors Python line by line. The generic `GGUFLoaderVisitor` traversal loads their tensors as-is.
-- **Patch form:** the children the restructured computation needs — plain modules such as split `Linear`s — registered where the computation needs them. Their `Parameter`s that are slices of a fused checkpoint tensor carry a split configuration (below), so the generic traversal and the generic `visit(Parameter&)` load them without any patch-specific visitor code.
+Any restructuring the rules force is applied as a **module patch**: a mode-specific variant of one module, active only when the graph is traced through a sharding runtime, never unconditionally. A module patch is a *sharding change* — it changes the module's structure (which children are registered and how `forward` combines them) for the sharded graph; the reference form stays 1:1 with Python (step 4). The patch's children that take their bytes from the reference's fused tensors load them through **split configurations** on their `Parameter`s — a load-time feature of the generic loaders (below), not part of the module structure.
 
 **Mode selection.** `Scope::runtime().use_sharding()` is true only when the active scope is traced through a `ShardingRuntime` (the meta backend). The constructor records it — `sharded_ = Scope::active() && Scope::runtime().use_sharding()` (before any scope exists the query reports not sharded) — and builds the mode-appropriate children; `forward` re-checks the same query and throws a clear error if the module was built for the other mode.
 
-**Split configurations.** A `Parameter` can declare that its bytes are a slice of a larger "fused" checkpoint tensor, in which case the loaders take that slice instead of reading the tensor at the parameter's own path:
-
-```cpp
-auto v = std::make_shared<Linear>(query_dim, inner_dim, bias);
-v->weight()->split_rows({"to_qkv_mlp_proj", "weight"}, 2 * inner_dim, 3 * inner_dim); // rows [2*inner, 3*inner)
-```
-
-`split_rows(fused, start, end)` / `split_cols(fused, start, end)` record the axis and the slice range; `fused` is the tensor's path as segments, relative to the parent of the module that owns the parameter (a `Linear` registered as `modules["v"]` of module M references M's sibling tensor `to_qkv_mlp_proj.weight` as `{"to_qkv_mlp_proj", "weight"}`) — the loaders join the segments with their own module-path separator (dot for the GGUF loader, dash for the test CLIs). The parameter's own path is never a checkpoint tensor — the loaders resolve the fused tensor under its reference name and stream the slice, so tests still pass the reference tensor under its Python name (`--param-to_qkv_mlp_proj-weight`) and a checkpoint still holds the reference's tensors, unmodified.
-**Permutation configurations.** A `Parameter` can also declare that its loaded values are a permutation of the checkpoint values — `permute_rows(perm)` / `permute_elements(perm)` (see `Parameter::Permutation`) — and the loaders apply the permutation once at load time, e.g. the Flux2 q/k projections and QK norms are loaded in the ggml MROPE (NEOX) head layout so attention runs the whole head dimension through one MROPE op. The loaders reorder the loaded bytes: rows as whole rows (any storage type), elements within each row (F32/F16/BF16 only); a split parameter is permuted after the slice. The test CLIs apply the same permutation to the values they bind, so tests pass the reference (unpermuted) weights under their Python names.
-
-**Loader plumbing.** Generic — one code path in two places, no per-model overloads:
-
-1. `GGUFLoaderVisitor::visit(Parameter&)` checks `parameter.split()`: they resolve the fused tensor (cached, since several split parameters can reference the same one), validate the slice against its shape and bounds, and stream it — contiguous row ranges via `read_rows` (rows are contiguous in the file: one seek+read), column ranges via `read_cols` (one seek+read per row; boundaries must align to the quantization block size so quantized types like Q8_0 slice without dequantization), a 1-D bias column-sliced the same way. A parameter with a permutation configuration gets its values permuted after the slice.
-2. The test CLIs' shared `TestCLI::CreateParametersVisitor` handles the same configuration, so tests still pass the reference tensor under its Python name and the visitor slices it — F32 rows/cols, or raw quantized bytes when the quantization spec resolves a non-F32 type for the fused tensor. Permutation configurations are applied the same way, after the slice — to the parsed F32 values or the raw quantized bytes.
+**Reconstruction.** Sometimes model graph needs reconstruction to allow sharded path. Models like Flux2 fuse weight parameters. The patch's restructured children can take their weights from the reference's *fused* tensors — the patch's separate `q` / `k` / `v` `Linear`s are slices of the reference's single `to_qkv_mlp_proj.weight`. A **split configuration** on a `Parameter` tells the loaders to take the parameter's bytes from that fused tensor instead of from the tensor at the parameter's own path — a load-time feature of the generic loaders; the module structure does not change.
 
 The restructured math is identical to the reference — so a patch changes where the computation lives, never what it computes.
 
-### Example: Flux2's fused weights
+### Example: Flux2's reconstruction
 
 The Flux2 transformer fuses several projections into single `Linear`s (a single-device memory optimization of the Python reference), and each fusion breaks a different rule above. Each fusion is patched in the module's constructor by registering the restructured `Linear`s whose weight/bias `Parameter`s carry the split configurations:
 
 | Python reference child | Rule it breaks | Patch: restructured children |
 |---|---|---|
-| `attn.to_qkv_mlp_proj` — one fused `Linear` for q/k/v + the MLP's `gate \| up` input | **view**: the q/k/v chunks of the fused output inherit no shard, so the heads-sharded q/k/v that `flash_attn` requires cannot be read out of it; **elementwise**: the SwiGLU `gate * up` over the fused `gate \| up` output would be a cross-device product | `q` / `k` / `v` and `mlp_in_gate` / `mlp_in_up` `Linear`s, column-parallel (weight `S(1)` → output `S(0)`) so each q/k/v is the direct output of its own projection and the SwiGLU product stays `S(0)`; their weights are row slices of `to_qkv_mlp_proj.weight` (`split_rows`) — the `q` / `k` weights additionally carry the MROPE row permutation (`Parameter::Permutation`), which applies after the slice |
+| `attn.to_qkv_mlp_proj` — one fused `Linear` for q/k/v + the MLP's `gate \| up` input | **view**: the q/k/v chunks of the fused output inherit no shard, so the heads-sharded q/k/v that `flash_attn` requires cannot be read out of it; **elementwise**: the SwiGLU `gate * up` over the fused `gate \| up` output would be a cross-device product | `q` / `k` / `v` and `mlp_in_gate` / `mlp_in_up` `Linear`s, column-parallel (weight `S(1)` → output `S(0)`) so each q/k/v is the direct output of its own projection and the SwiGLU product stays `S(0)`; their weights are row slices of `to_qkv_mlp_proj.weight` (`split_rows`) |
 | `attn.to_out` — one fused `Linear` over the `[attn; mlp]` concat | **concat** along a sharded axis is forbidden | `attn` / `mlp` row-parallel `Linear`s whose outputs are added (`W @ [a; b] = W_a @ a + W_b @ b`); their weights are column slices of `to_out.weight` (`split_cols`), the shared bias is the full `to_out.bias` on the `attn` side |
 | `ff.linear_in` — one fused `Linear` for `gate \| up` | **elementwise** (as above) | `gate` / `up` `Linear`s; their weights are row slices of `linear_in.weight`, their biases column slices of `linear_in.bias` |
 
-The split configurations slice the fused checkpoint tensors the way the reference math splits them, so the loaders carry no Flux2-specific code at all — see the patch branches in [`Flux2ParallelSelfAttention`](src/diffusers/models/transformers/flux2/Flux2ParallelSelfAttention.hpp) and [`Flux2FeedForward`](src/diffusers/models/transformers/flux2/Flux2FeedForward.hpp).
+## 8. Optimize the port
 
-## 8. Check the sharding plan is optimal
+The port is now working: the suite is green on one device (step 5) and on two under a feasible sharding plan (steps 6–7). Now optimize it — the order is deliberate: **get the port up and running first, optimize later**. Optimizations come after the sharding patches: never restructure the 1:1 port or the sharding plan up front for an optimization. Two tracks:
+
+- **The sharding plan** — check the printed plan is optimal and restructure while it is not ([below](#check-the-sharding-plan-is-optimal)).
+- **The graph itself** — replace part of the computation with an equivalent that runs more effectively on the C++ runtime, keeping the module structure 1:1 with Python; in this project that runs through [load-time parameter permutation](#load-time-parameter-permutation) (e.g. the MROPE head layout for Flux2 attention).
+
+After every optimization, re-run the full suites (`N_DEVICES=1` and `N_DEVICES=2`) and compare the numbers — an optimization is only a win if they improve and both suites stay green.
+
+### Check the sharding plan is optimal
 
 A feasible plan is not automatically a good one. Every sharded run prints the plan to stderr — inspect a passing run with `VERBOSE=true N_DEVICES=2 ctest --test-dir build -V -R "<name>"`, or run the test's CLI binary directly:
 
@@ -285,24 +272,58 @@ The planner's DP prices a candidate by the sum of its inputs' preference ranks (
 
 After each restructure, re-run the same test and compare `total cost`, the bridge count, and the replicated bytes — a restructure is only a win if the numbers improve and the `N_DEVICES=2` suite stays green. Repeat until the plan is fully sharded where the rules allow, the bridges are minimal, and the weights are sharded.
 
+### Load-time parameter permutation
+
+A graph optimization may need the parameter's values in a layout the reference does not use. The mechanism: the `Parameter` carries a **permutation configuration** — a load-time declaration the generic loaders apply once when they bind the bytes. The module structure (the children, the names, the `forward`) is untouched; only the loaded values differ. That is what makes it the vehicle for graph optimizations: **optimized graph execution while the Python 1:1 reference structure is preserved as long as possible**. No dedicated parameter module, no per-model visitor overload, no layout work in `forward`.
+
+**Permutation — e.g. the MROPE optimization.** `permute_rows(perm)` / `permute_elements(perm)` (see `Parameter::Permutation`) declare that the loaded values are a permutation of the checkpoint's values, applied once at load time. The Flux2 q/k projections and QK norms are loaded in the ggml MROPE (NEOX) head layout, so attention runs the whole head dimension through one `GGML_ROPE_TYPE_MROPE` op (see `Flux2PosEmbed`) instead of the reference's per-axis rotations. It is applied after the port works (step 8), and is declared on both forms of the module — reference and sharded — because both run the MROPE op.
+
+**Loader plumbing.** Generic — one code path in two places, no per-model overloads. The loaders reorder the loaded bytes: rows as whole rows (any storage type), elements within each row (F32/F16/BF16 only):
+
+1. In the GGUF loader, `GGUFLoaderVisitor::visit(Parameter&)` checks `parameter.permutation()` and reorders the parameter's freshly loaded bytes once at load time.
+2. The test CLIs' shared `TestCLI::CreateParametersVisitor` applies the same permutation to the values it binds — parsed F32 values, or raw quantized bytes when the quantization spec resolves a non-F32 type — so the tests still pass the reference (unpermuted) weights under their Python names.
+
+**Extending the mechanism.** When a new optimization needs a parameter in a layout the permutation cannot express — a transposed block, a non-contiguous gather, a reshaped slice — do not special-case the model; extend the mechanism instead. Add the new configuration struct and its setter to `Parameter`, and extend the two generic loaders to apply it: `GGUFLoaderVisitor::visit(Parameter&)` (the raw bytes from the file, including the quantized types) and `TestCLI::CreateParametersVisitor` (the parsed F32 values and the raw quantized bytes). Not a dedicated parameter subclass and not a per-model `visit` overload — that is exactly what the mechanism replaces. Keep the loaders generic, keep the checkpoint holding the reference tensors, and keep the tests passing the reference values under their Python names — the layout stays a load-time declaration on the `Parameter`, so the module tree and the `forward`'s 1:1 form do not change.
+
 ## 9. Analyze the quantization
 
-The goal: the most compressed model whose output still matches the Python reference within the end-to-end tolerance (the pipeline test allows a max pixel difference of 2.5/255).
+The goal: the most compressed model whose output still matches the Python reference within the pipeline test's end-to-end tolerance.
 
-The tool is [test/utils/quant_quality.py](test/utils/quant_quality.py). It builds the same tiny pipeline as the end-to-end `test_call`, runs it once with the original float32 weights (the reference), and again under every candidate spec: each parameter is quantized and dequantized exactly the way `utils/convert-model` does, and the resulting float32 values are loaded back into the Python reference, so both sides see identical values. For every spec it reports, against the float32 reference:
+There is no reusable tool — the measurement script is as model-specific as the port itself: which signals to capture, which tensor groups to test, and which specs to compare are properties of the model. Write the script yourself: a standalone file under `test/` (it imports the `utils` package, so insert the `test/` directory into `sys.path`), run with `uv run python <script>` from `test/`. The methodology below is model-independent, and every building block it needs already exists in `test/utils/__init__.py`.
 
-- the text encoder's prompt-embedding error (relative L2 + max abs), computed with identical token inputs;
-- the transformer's first denoising-step noise prediction error (identical latents and float32 embeddings, so the transformer error is isolated from the encoder's);
-- the final image error (max / mean absolute pixel difference, 0–255 scale);
-- the storage the GGUF would take (MiB and % of float32).
+### Measure the quantization error in the Python reference, not the C++ port
 
-Run it from the `test/` directory:
+The C++ port is already verified 1:1 against the Python reference (steps 4–5), so measure the quantization error where the expected values are exactly known: in the Python reference. For a candidate spec:
 
-```bash
-uv run python utils/quant_quality.py
-```
+1. Resolve each parameter's quantization type with `QuantSpec` — the same grammar as the `--type` option of `utils/convert-model` (a bare type name, a per-tensor JSON map, or a per-component object with a `*` default).
+2. Round-trip every quantized parameter through `quantize_to_bytes(tensor, qtype)` — the same `gguf.quantize` call `utils/convert-model` uses to write the GGUF bytes — and `dequantize_to_float32(raw, qtype, shape)` — the float32 values ggml computes from those bytes.
+3. Load the dequantized values into the Python reference and run it.
 
-Iterate on candidate specs the way the script does: start from a baseline (e.g. `Q8_0` everywhere except the attention norm weights), then test tensor group by tensor group — modulation, input embedders and timestep embeddings, output projections, attention projections, feed-forwards, the single-stream blocks, the text encoder's embedding table / attention / MLPs, the VAE — and promote a group to `BF16`/`F32` only when the measured error says it is sensitive. Expectations the script's numbers confirm: the VAE stays float (it decodes pixels), norm weights (q/k norms, layernorms) stay `F32`, the big GEMM weights take `Q8_0`; embeddings, modulation, and input/output projections are usually the sensitive ones. The table decides what stays float, not taste.
+The measured error is then pure quantization error, and it is exactly what the shipped GGUF produces: the end-to-end test does the same round-trip ([step 10](#10-write-the-quantization-config)) — the C++ side receives the raw quantized bytes, the Python reference computes with the dequantized values, both sides see identical numbers.
+
+### Build the same tiny pipeline as the end-to-end test
+
+Take the end-to-end test configuration — a model in the real model's shape class with the structurally relevant features (the RoPE axis layout, GQA, the double/single-stream block layout, the multi-block VAE) at a small scale — and the same fixed inputs: one prompt, a few denoising steps, a fixed-seed `torch.Generator`, inputs passed explicitly. Small enough to run many specs, faithful enough that the measured errors represent the real model.
+
+### Capture the reference signals
+
+Run the pipeline once with the original float32 weights and record the signals every spec is scored against:
+
+- **One intermediate output per pipeline component**, each computed under identical inputs so the component's error is isolated from the others' — e.g. the text encoder's prompt embeddings (`encode_prompt` on the same tokens) and the transformer's first denoising-step noise prediction. Capture intermediate outputs with a monkey-patched spy on the component's `forward`: record its first call (output and arguments) during the pipeline run, then replay the recorded call on the current weights. Replaying is what keeps the inputs identical — feeding the quantized encoder's embeddings into the transformer would otherwise mix the two components' errors.
+- **The final output** — max / mean absolute difference, the number compared against the pipeline test's tolerance.
+
+### Iterate over candidate specs
+
+Express every candidate in the spec grammar above, so the winning spec is literally the JSON config written in [step 10](#10-write-the-quantization-config). For each spec: restore the original float32 state (clone it once up front — `state_dict()` shares storage with the live parameters), apply the round-trip to every parameter (buffers are never quantized — the C++ side computes them internally), recompute the signals, and report against the float32 reference: relative L2 + max abs per intermediate signal, max / mean pixel difference for the image, and the GGUF storage (MiB and % of float32 — plain dtypes are elements × bytes, block types through `gguf.quant_shape_to_byte_shape`).
+
+Structure the spec set as:
+
+1. **A baseline** — e.g. `Q8_0` everywhere except the attention norm weights (or the current checked-in config, if one exists).
+2. **One spec per tensor group** — the baseline plus one group promoted to `BF16`/`F32`; the groups are the model's natural tensor families — the block modulation (shift/scale/gate), the input embedders and timestep embeddings, the final output projection, the attention projections, the feed-forwards, the single-stream blocks, the text encoder's embedding table / attention / MLPs, the VAE.
+3. **A worst case** — everything `Q8_0`, no exceptions; it bounds the damage (and should come out the worst row — if it doesn't, the script is broken).
+4. **Composite candidates** — the promoted groups combined, for the final config.
+
+Promote a group to `BF16`/`F32` only when the measured error says it is sensitive. Expectations the numbers are supposed to confirm: the VAE stays float (it decodes pixels), norm weights (q/k norms, layernorms) stay `F32`, the big GEMM weights take `Q8_0`; embeddings, modulation, and input/output projections are usually the sensitive ones. The table decides what stays float, not taste.
 
 ## 10. Write the quantization config
 
@@ -330,7 +351,7 @@ A pipeline meeting all four is marked **Ported** [in the README](README.md#suppo
 |---|---|
 | `pipe(...)` runs eagerly, returns an output dataclass | `pipeline(contexts, options)` returns a `Computation<Tensor>`; it executes later, on CPU, GPU, or sharded |
 | `module(...)` eager forward | `module.forward(scope, ...)`: builds into the graph; the `Scope` allocates and frees compute tensors |
-| `from_pretrained()` loads safetensors from the HF hub | `from_pretrained()` loads per-component `model.gguf` files via the `GGUFLoaderVisitor`; `Parameter`s are declared shapes filled at load time |
+| `from_pretrained()` loads safetensors from the HF hub | `from_pretrained()` loads per-component `model.gguf` files via the `GGUFLoaderVisitor`; `Parameter`s are declared shapes filled at load time (applying any load-time parameter configuration they declare) |
 | `torch.Generator` / `randn_tensor` noise | `std::mt19937` via `computation.state(...)` — a different RNG stream; pass initial latents for deterministic runs |
 | `.to(device)`, `torch_dtype`, device workarounds | The device is chosen at runtime by the execution engine; no device or dtype bookkeeping inside modules |
 | `PIL.Image` | `Image` (stb) |
