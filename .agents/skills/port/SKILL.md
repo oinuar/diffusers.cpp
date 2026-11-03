@@ -131,7 +131,7 @@ private:
 - **Class name = Python class name.** The model must be constructible from the same upstream `config.json` schema (`Config::from_file`), so keep the config fields and their defaults.
 - **Child names define the tensor-name path.** The `modules` map key is the Python attribute name; the dotted path (e.g. `transformer_blocks.0.attn.q.weight`) is how the GGUF loader matches parameters — keep it identical to upstream.
 - **`Parameter` holds a declared shape and dtype — no data.** Data is bound at load time by the visitor; a ported model is therefore fully constructible from config before any weights exist.
-- **Weight loading is free.** `from_pretrained` walks the module tree with `GGUFLoaderVisitor`, which resolves each `Parameter` by name, validates its shape, and streams the bytes from the component's `model.gguf`. No per-module loading code.
+- **Weight loading is free.** `from_pretrained` walks the module tree with `GGUFLoaderVisitor`, which resolves each `Parameter` by name (a split `Parameter` resolves through its [split configuration](#module-patches) from the fused tensor it slices), validates its shape, and streams the bytes from the component's `model.gguf`. No per-module loading code.
 
 #### 4.2.2 Implement `forward`
 
@@ -225,34 +225,41 @@ The planner tries only the split states the meta backend accepts; when none surv
 
 Any restructuring the rules force is applied as a **module patch**: a mode-specific variant of one module, active only when the graph is traced through a sharding runtime, never unconditionally. The reference form stays 1:1 with Python (step 4).
 
-**Two forms under one name.** The patched module builds both forms under the *same child names*, so the module tree and the checkpoint tensor names are Python's in both modes:
+**Two forms under one name.** The patch is built in the module's constructor and `forward` branches on the same query:
 
 - **Reference form (default):** the Python children as-is, with a `forward` that mirrors Python line by line. The generic `GGUFLoaderVisitor` traversal loads their tensors as-is.
-- **Patch form:** a dedicated patch module stands in for the child(ren) the restructuring replaces, holding the children the restructured computation needs.
+- **Patch form:** the children the restructured computation needs — plain modules such as split `Linear`s — registered where the computation needs them. Their `Parameter`s that are slices of a fused checkpoint tensor carry a split configuration (below), so the generic traversal and the generic `visit(Parameter&)` load them without any patch-specific visitor code.
 
 **Mode selection.** `Scope::runtime().use_sharding()` is true only when the active scope is traced through a `ShardingRuntime` (the meta backend). The constructor records it — `sharded_ = Scope::active() && Scope::runtime().use_sharding()` (before any scope exists the query reports not sharded) — and builds the mode-appropriate children; `forward` re-checks the same query and throws a clear error if the module was built for the other mode.
 
-**Patch module anatomy.** The children the restructured computation needs, with typed accessors; a `forward` that performs the restructured computation; and an `accept()` that always dispatches to the module-specific visit — `visitor.visit(*this, std::move(path))` — never the generic traversal, which would try to load the patch's children by name from a checkpoint that holds only the reference's tensors.
+**Split configurations.** A `Parameter` can declare that its bytes are a slice of a larger "fused" checkpoint tensor, in which case the loaders take that slice instead of reading the tensor at the parameter's own path:
 
-**Loader plumbing.** One visit overload per patch type, in three places:
+```cpp
+auto v = std::make_shared<Linear>(query_dim, inner_dim, bias);
+v->weight()->split_rows({"to_qkv_mlp_proj", "weight"}, 2 * inner_dim, 3 * inner_dim); // rows [2*inner, 3*inner)
+```
 
-1. `src/nn/Visitor.hpp` declares the no-op `virtual void visit(<Patch>&, std::vector<std::string>) {}`; `RethrowVisitor` wraps it with `visitWithCatch`.
-2. `GGUFLoaderVisitor` implements it: because the patch keeps the reference child's name, it resolves the reference tensor(s) at the patch's own path (e.g. `module_path(path, {}, {"weight"})`), validates their shapes, and fills each child from the part of them the restructured math uses — contiguous row ranges via `read_rows` (rows are contiguous in the file: one seek+read), column ranges via `read_cols` (one seek+read per row; boundaries must align to the quantization block size so quantized types like Q8_0 slice without dequantization), a 1-D bias column-sliced the same way.
-3. The test CLI's `CreateParametersVisitor` mirrors the overload, so tests still pass the reference tensor under its Python name (`--param-<child>-weight`) and the visit slices it — F32 rows/cols, or raw quantized bytes (`slice_*_bytes`) when the quantization spec resolves a non-F32 type.
+`split_rows(fused, start, end)` / `split_cols(fused, start, end)` record the axis and the slice range; `fused` is the tensor's path as segments, relative to the parent of the module that owns the parameter (a `Linear` registered as `modules["v"]` of module M references M's sibling tensor `to_qkv_mlp_proj.weight` as `{"to_qkv_mlp_proj", "weight"}`) — the loaders join the segments with their own module-path separator (dot for the GGUF loader, dash for the test CLIs). The parameter's own path is never a checkpoint tensor — the loaders resolve the fused tensor under its reference name and stream the slice, so tests still pass the reference tensor under its Python name (`--param-to_qkv_mlp_proj-weight`) and a checkpoint still holds the reference's tensors, unmodified.
+**Permutation configurations.** A `Parameter` can also declare that its loaded values are a permutation of the checkpoint values — `permute_rows(perm)` / `permute_elements(perm)` (see `Parameter::Permutation`) — and the loaders apply the permutation once at load time, e.g. the Flux2 q/k projections and QK norms are loaded in the ggml MROPE (NEOX) head layout so attention runs the whole head dimension through one MROPE op. The loaders reorder the loaded bytes: rows as whole rows (any storage type), elements within each row (F32/F16/BF16 only); a split parameter is permuted after the slice. The test CLIs apply the same permutation to the values they bind, so tests pass the reference (unpermuted) weights under their Python names.
 
-The restructured math is identical to the reference — so a patch changes where the computation lives, never what it computes. `GGUFLoaderVisitor` may reference only patch modules; every other module loads through the generic traversal.
+**Loader plumbing.** Generic — one code path in two places, no per-model overloads:
+
+1. `GGUFLoaderVisitor::visit(Parameter&)` checks `parameter.split()`: they resolve the fused tensor (cached, since several split parameters can reference the same one), validate the slice against its shape and bounds, and stream it — contiguous row ranges via `read_rows` (rows are contiguous in the file: one seek+read), column ranges via `read_cols` (one seek+read per row; boundaries must align to the quantization block size so quantized types like Q8_0 slice without dequantization), a 1-D bias column-sliced the same way. A parameter with a permutation configuration gets its values permuted after the slice.
+2. The test CLIs' shared `TestCLI::CreateParametersVisitor` handles the same configuration, so tests still pass the reference tensor under its Python name and the visitor slices it — F32 rows/cols, or raw quantized bytes when the quantization spec resolves a non-F32 type for the fused tensor. Permutation configurations are applied the same way, after the slice — to the parsed F32 values or the raw quantized bytes.
+
+The restructured math is identical to the reference — so a patch changes where the computation lives, never what it computes.
 
 ### Example: Flux2's fused weights
 
-The Flux2 transformer fuses several projections into single `Linear`s (a single-device memory optimization of the Python reference), and each fusion breaks a different rule above. Each fusion gets one patch module, applied exactly as described:
+The Flux2 transformer fuses several projections into single `Linear`s (a single-device memory optimization of the Python reference), and each fusion breaks a different rule above. Each fusion is patched in the module's constructor by registering the restructured `Linear`s whose weight/bias `Parameter`s carry the split configurations:
 
-| Python reference child | Rule it breaks | Patch module: restructured children |
+| Python reference child | Rule it breaks | Patch: restructured children |
 |---|---|---|
-| `attn.to_qkv_mlp_proj` — one fused `Linear` for q/k/v + the MLP's `gate \| up` input | **view**: the q/k/v chunks of the fused output inherit no shard, so the heads-sharded q/k/v that `flash_attn` requires cannot be read out of it; **elementwise**: the SwiGLU `gate * up` over the fused `gate \| up` output would be a cross-device product | [`Flux2FusedQKVProjection`](src/diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp): `q` / `k` / `v` and `mlp_in_gate` / `mlp_in_up` `Linear`s, column-parallel (weight `S(1)` → output `S(0)`) so each q/k/v is the direct output of its own projection and the SwiGLU product stays `S(0)` |
-| `attn.to_out` — one fused `Linear` over the `[attn; mlp]` concat | **concat** along a sharded axis is forbidden | [`Flux2FusedAttentionOutput`](src/diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp): `attn` / `mlp` row-parallel `Linear`s whose outputs are added (`W @ [a; b] = W_a @ a + W_b @ b`) |
-| `ff.linear_in` — one fused `Linear` for `gate \| up` | **elementwise** (as above) | [`Flux2FusedLinearIn`](src/diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp): `gate` / `up` `Linear`s; each output is `S(0)`, the product stays `S(0)`, so `linear_out` runs row-parallel (`S(0)` → `P` → AllReduce → `R`) |
+| `attn.to_qkv_mlp_proj` — one fused `Linear` for q/k/v + the MLP's `gate \| up` input | **view**: the q/k/v chunks of the fused output inherit no shard, so the heads-sharded q/k/v that `flash_attn` requires cannot be read out of it; **elementwise**: the SwiGLU `gate * up` over the fused `gate \| up` output would be a cross-device product | `q` / `k` / `v` and `mlp_in_gate` / `mlp_in_up` `Linear`s, column-parallel (weight `S(1)` → output `S(0)`) so each q/k/v is the direct output of its own projection and the SwiGLU product stays `S(0)`; their weights are row slices of `to_qkv_mlp_proj.weight` (`split_rows`) — the `q` / `k` weights additionally carry the MROPE row permutation (`Parameter::Permutation`), which applies after the slice |
+| `attn.to_out` — one fused `Linear` over the `[attn; mlp]` concat | **concat** along a sharded axis is forbidden | `attn` / `mlp` row-parallel `Linear`s whose outputs are added (`W @ [a; b] = W_a @ a + W_b @ b`); their weights are column slices of `to_out.weight` (`split_cols`), the shared bias is the full `to_out.bias` on the `attn` side |
+| `ff.linear_in` — one fused `Linear` for `gate \| up` | **elementwise** (as above) | `gate` / `up` `Linear`s; their weights are row slices of `linear_in.weight`, their biases column slices of `linear_in.bias` |
 
-The loader overloads slice the fused checkpoint tensors the way the reference math splits them — `read_rows` for `to_qkv_mlp_proj` → `q` / `k` / `v` / `mlp_in_gate` / `mlp_in_up` and `linear_in` → `gate` / `up` (plus bias segments), `read_cols` for `to_out` → `attn` / `mlp` — and the test CLIs mirror the same slicing.
+The split configurations slice the fused checkpoint tensors the way the reference math splits them, so the loaders carry no Flux2-specific code at all — see the patch branches in [`Flux2ParallelSelfAttention`](src/diffusers/models/transformers/flux2/Flux2ParallelSelfAttention.hpp) and [`Flux2FeedForward`](src/diffusers/models/transformers/flux2/Flux2FeedForward.hpp).
 
 ## 8. Check the sharding plan is optimal
 

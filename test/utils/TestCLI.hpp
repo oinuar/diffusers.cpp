@@ -116,6 +116,15 @@ public:
         {}
         virtual void visit(Parameter& parameter, std::vector<std::string> path) {
             ModulePath module_path("-", "--param");
+
+            // A split parameter (see Parameter::Split): its values live
+            // in a fused tensor, not at its own path -- load the fused
+            // tensor and take the configured slice.
+            if (auto split = parameter.split()) {
+                visit_split(parameter, path, *split, module_path);
+                return;
+            }
+
             auto joined_path = module_path(path, prefix_);
 
             // Quantized parameter (see --quant): the value is a file with
@@ -124,15 +133,41 @@ public:
             if (auto type = quantization().resolve(dot_name(path), prefix_); type && *type != parameter.dtype()) {
                 auto bytes = get_param_bytes(joined_path);
 
+                // A permuted parameter (see Parameter::Permutation): the
+                // raw bytes are reordered at load time, mirroring the
+                // GGUF loader.
+                if (auto permutation = parameter.permutation())
+                    bytes = permute_bytes(bytes, *type, parameter.shape(), *permutation, joined_path);
+
                 auto tensor = create_quantized(joined_path, parameter.shape(), *type, std::move(bytes));
 
                 parameter.set(tensor.name(joined_path));
                 return;
             }
 
-            ArgumentParser::parser<Tensor> parser(context_, parameter.dtype());
+            // Plain parameter: a tensor literal (inline or in the file the
+            // --param option points to), parsed as floats and bound as the
+            // parameter's dtype.
+            auto value = get_param(joined_path);
 
-            auto tensor = parser(joined_path, get_param(joined_path));
+            ArgumentParser::parser<Tensor>::TensorParser parser(joined_path, value, parameter.dtype());
+
+            Tensor::Shape shape;
+            std::vector<float> data;
+
+            try {
+                std::tie(shape, data) = parser.parse();
+            } catch (const std::runtime_error& error) {
+                throw std::runtime_error("invalid argument " + joined_path + ": " + error.what());
+            }
+
+            // A permuted parameter (see Parameter::Permutation): the
+            // values are reordered at load time, mirroring the GGUF
+            // loader.
+            if (auto permutation = parameter.permutation())
+                data = permute_values(data, shape, *permutation, joined_path);
+
+            auto tensor = ArgumentParser::parser<Tensor>::create(context_, shape, std::move(data), parameter.dtype());
 
             parameter.set(tensor.name(joined_path));
         }
@@ -238,6 +273,354 @@ public:
         }
 
     private:
+        // Loads a split parameter (see Parameter::Split) from the fused
+        // tensor the split configuration points to, mirroring the way
+        // GGUFLoaderVisitor streams the slice from a GGUF file.
+        void visit_split(Parameter& parameter, const std::vector<std::string>& path, const Parameter::Split& split, ModulePath module_path) {
+            auto fused_segments = parameter.split_fused_path(path);
+            auto fused_path = module_path(fused_segments, prefix_);
+
+            // The slice is named after its fused tensor and the parameter:
+            // "...to_qkv_mlp_proj.weight-q-weight".
+            auto slice_path = fused_path + "-" + path[path.size() - 2] + "-" + path[path.size() - 1];
+
+            auto shape = parameter.shape();
+
+            // Quantized fused tensor (see --quant): the file holds the
+            // raw bytes of the fused tensor, like a tensor in a GGUF
+            // file from utils/convert-model.
+            if (auto type = quantization().resolve(dot_name(fused_segments), prefix_); type && *type != parameter.dtype()) {
+                auto bytes = get_param_bytes(fused_path);
+
+                std::vector<std::byte> sliced;
+
+                if (split.axis == Parameter::Split::Axis::Rows) {
+                    // Rows are contiguous in memory, so the split is a
+                    // plain byte-range slice. The row length is the
+                    // parameter's last dimension.
+                    auto cols = shape[shape.rank() - 1];
+                    auto row_bytes = static_cast<size_t>(ggml_row_size(*type, cols));
+
+                    if (bytes.size() % row_bytes != 0 || split.end * row_bytes > bytes.size())
+                        throw std::runtime_error(
+                            "Split parameter '" + slice_path + "': the row split [" +
+                            std::to_string(split.start) + ", " + std::to_string(split.end) +
+                            ") of '" + fused_path + "' is out of bounds");
+
+                    sliced = slice_rows_bytes(bytes, *type, cols, split.start, split.end);
+                }
+                else {
+                    // The column range must fall on quantization block
+                    // boundaries, so the slice is a per-row byte range.
+                    // The row count is the parameter's first dimension
+                    // (1 for a 1-D parameter); the full row length
+                    // follows from the fused tensor's element count.
+                    auto rows = shape.rank() > 1 ? shape[0] : 1;
+
+                    auto blck = static_cast<size_t>(ggml_blck_size(*type));
+                    auto block_bytes = static_cast<size_t>(ggml_type_size(*type));
+
+                    if (bytes.size() % block_bytes != 0)
+                        throw std::runtime_error(
+                            "Split parameter '" + slice_path + "': the size of '" + fused_path +
+                            "' is not a multiple of the quantization block size");
+
+                    auto elements = bytes.size() / block_bytes * blck;
+
+                    if (elements % rows != 0)
+                        throw std::runtime_error(
+                            "Split parameter '" + slice_path + "': the element count of '" +
+                            fused_path + "' is not divisible by the row count");
+
+                    auto cols = elements / rows;
+
+                    if (split.end > cols)
+                        throw std::runtime_error(
+                            "Split parameter '" + slice_path + "': the column split [" +
+                            std::to_string(split.start) + ", " + std::to_string(split.end) +
+                            ") of '" + fused_path + "' is out of bounds");
+
+                    sliced = slice_cols_bytes(bytes, *type, rows, cols, split.start, split.end);
+                }
+
+                // A permuted parameter (see Parameter::Permutation): the
+                // raw bytes are reordered at load time, mirroring the
+                // GGUF loader; the permutation applies to the slice.
+                if (auto permutation = parameter.permutation())
+                    sliced = permute_bytes(sliced, *type, shape, *permutation, slice_path);
+
+                parameter.set(create_quantized(slice_path, shape, *type, std::move(sliced)));
+                return;
+            }
+
+            // Plain (F32) fused tensor.
+            auto fused_value = get_param(fused_path);
+            ArgumentParser::parser<Tensor>::TensorParser parser(fused_path, fused_value);
+
+            auto [fused_shape, data] = parser.parse();
+
+            auto cols = fused_shape[fused_shape.rank() - 1];
+            auto rows = 1;
+
+            for (auto r = 0; r + 1 < fused_shape.rank(); ++r)
+                rows *= fused_shape[r];
+
+            std::vector<float> sliced;
+
+            if (split.axis == Parameter::Split::Axis::Rows) {
+                if (fused_shape.rank() != 2)
+                    throw std::runtime_error(
+                        "Split parameter '" + slice_path + "': a row split requires a 2-D fused tensor, got " + fused_shape.to_string());
+
+                if (split.end > rows)
+                    throw std::runtime_error(
+                        "Split parameter '" + slice_path + "': the row split [" +
+                        std::to_string(split.start) + ", " + std::to_string(split.end) +
+                        ") of '" + fused_path + "' is out of bounds");
+
+                sliced = slice_rows(data, cols, split.start, split.end);
+            }
+            else {
+                if (fused_shape.rank() > 2)
+                    throw std::runtime_error(
+                        "Split parameter '" + slice_path + "': a column split requires a 1-D or 2-D fused tensor, got " + fused_shape.to_string());
+
+                if (split.end > cols)
+                    throw std::runtime_error(
+                        "Split parameter '" + slice_path + "': the column split [" +
+                        std::to_string(split.start) + ", " + std::to_string(split.end) +
+                        ") of '" + fused_path + "' is out of bounds");
+
+                sliced = slice_cols(data, rows, cols, split.start, split.end);
+            }
+
+            // A permuted parameter (see Parameter::Permutation): the
+            // values are reordered at load time, mirroring the GGUF
+            // loader; the permutation applies to the slice.
+            if (auto permutation = parameter.permutation())
+                sliced = permute_values(sliced, shape, *permutation, slice_path);
+
+            auto elements = 1;
+
+            for (auto r = 0; r < shape.rank(); ++r)
+                elements *= shape[r];
+
+            if (sliced.size() != elements)
+                throw std::runtime_error(
+                    "Split parameter '" + slice_path + "': the slice of '" + fused_path + "' has " +
+                    std::to_string(sliced.size()) + " elements, expected " + std::to_string(elements));
+
+            parameter.set(context().create<float>(shape, [sliced = std::move(sliced)](std::mt19937&) {
+                return sliced;
+            }).name(slice_path));
+        }
+
+        // PyTorch: x[start:end]
+        template <typename T>
+        static std::vector<T> slice_rows(
+            const std::vector<T>& x,
+            size_t cols,
+            size_t start,
+            size_t end)
+        {
+            return {
+                x.begin() + start * cols,
+                x.begin() + end * cols
+            };
+        }
+
+        // PyTorch: x[:, start:end]
+        template <typename T>
+        static std::vector<T> slice_cols(
+            const std::vector<T>& x,
+            size_t rows,
+            size_t cols,
+            size_t start,
+            size_t end)
+        {
+            std::vector<T> out;
+            out.reserve(rows * (end - start));
+
+            for (size_t r = 0; r < rows; ++r) {
+                out.insert(
+                    out.end(),
+                    x.begin() + r * cols + start,
+                    x.begin() + r * cols + end);
+            }
+
+            return out;
+        }
+
+        // The raw-bytes counterpart of slice_rows: rows of a 2-D quantized
+        // tensor are contiguous, each row is ggml_row_size bytes long.
+        static std::vector<std::byte> slice_rows_bytes(
+            const std::vector<std::byte>& x,
+            ggml_type type,
+            size_t cols,
+            size_t start,
+            size_t end)
+        {
+            auto row_bytes = static_cast<size_t>(ggml_row_size(type, cols));
+
+            return {
+                x.begin() + start * row_bytes,
+                x.begin() + end * row_bytes
+            };
+        }
+
+        // The raw-bytes counterpart of slice_cols: the column range must
+        // fall on quantization block boundaries, so the slice is a
+        // per-row byte range.
+        static std::vector<std::byte> slice_cols_bytes(
+            const std::vector<std::byte>& x,
+            ggml_type type,
+            size_t rows,
+            size_t cols,
+            size_t start,
+            size_t end)
+        {
+            auto blck = static_cast<size_t>(ggml_blck_size(type));
+
+            if (start % blck != 0 || (end - start) % blck != 0)
+                throw std::runtime_error(
+                    "The quantized fused weight column range [" + std::to_string(start) + ", " +
+                    std::to_string(end) + ") is not aligned to the quantization block size " +
+                    std::to_string(blck));
+
+            auto row_bytes = static_cast<size_t>(ggml_row_size(type, cols));
+            auto block_bytes = static_cast<size_t>(ggml_type_size(type));
+            auto slice_offset = start / blck * block_bytes;
+            auto slice_bytes = (end - start) / blck * block_bytes;
+
+            std::vector<std::byte> out;
+            out.reserve(rows * slice_bytes);
+
+            for (size_t r = 0; r < rows; ++r)
+                out.insert(
+                    out.end(),
+                    x.begin() + r * row_bytes + slice_offset,
+                    x.begin() + r * row_bytes + slice_offset + slice_bytes);
+
+            return out;
+        }
+
+        // Applies a permutation configuration (see Parameter::Permutation)
+        // to the parsed (float) values, mirroring the GGUF loader's
+        // byte-level permutation: rows are reordered as whole rows,
+        // elements are reordered within each row.
+        static std::vector<float> permute_values(
+            const std::vector<float>& x,
+            const Tensor::Shape& shape,
+            const Parameter::Permutation& permutation,
+            const std::string& name)
+        {
+            auto cols = shape[shape.rank() - 1];
+            auto rows = 1;
+
+            for (auto r = 0; r + 1 < shape.rank(); ++r)
+                rows *= shape[r];
+
+            if (permutation.perm.size() != static_cast<size_t>(permutation.axis == Parameter::Permutation::Axis::Rows ? rows : cols))
+                throw std::runtime_error(
+                    "Parameter '" + name + "': permutation size mismatch");
+
+            std::vector<float> out(x.size());
+
+            if (permutation.axis == Parameter::Permutation::Axis::Rows) {
+                for (size_t r = 0; r < rows; ++r) {
+                    if (permutation.perm[r] >= rows)
+                        throw std::runtime_error(
+                            "Parameter '" + name + "': permutation out of range");
+
+                    std::copy(
+                        x.begin() + permutation.perm[r] * cols,
+                        x.begin() + (permutation.perm[r] + 1) * cols,
+                        out.begin() + r * cols);
+                }
+            } else {
+                for (size_t r = 0; r < rows; ++r) {
+                    for (size_t j = 0; j < cols; ++j) {
+                        if (permutation.perm[j] >= cols)
+                            throw std::runtime_error(
+                                "Parameter '" + name + "': permutation out of range");
+
+                        out[r * cols + j] = x[r * cols + permutation.perm[j]];
+                    }
+                }
+            }
+
+            return out;
+        }
+
+        // The raw-bytes counterpart of permute_values, for quantized
+        // types: rows are reordered as whole rows (exact for every
+        // storage type), elements are reordered within each row (exact
+        // for F32/F16/BF16 only).
+        static std::vector<std::byte> permute_bytes(
+            const std::vector<std::byte>& x,
+            ggml_type type,
+            const Tensor::Shape& shape,
+            const Parameter::Permutation& permutation,
+            const std::string& name)
+        {
+            size_t element_bytes = 0;
+
+            if (permutation.axis == Parameter::Permutation::Axis::Elements) {
+                switch (type) {
+                case GGML_TYPE_F32:    element_bytes = 4; break;
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:   element_bytes = 2; break;
+                default:
+                    throw std::runtime_error(
+                        "Parameter '" + name +
+                        "': element permutation is not supported for type " +
+                        std::string(ggml_type_name(type)));
+                }
+            }
+
+            auto cols = shape[shape.rank() - 1];
+            auto rows = 1;
+
+            for (auto r = 0; r + 1 < shape.rank(); ++r)
+                rows *= shape[r];
+
+            auto row_bytes = static_cast<size_t>(ggml_row_size(type, cols));
+
+            if (permutation.perm.size() != static_cast<size_t>(permutation.axis == Parameter::Permutation::Axis::Rows ? rows : cols))
+                throw std::runtime_error(
+                    "Parameter '" + name + "': permutation size mismatch");
+
+            std::vector<std::byte> out(x.size());
+
+            if (permutation.axis == Parameter::Permutation::Axis::Rows) {
+                for (size_t r = 0; r < rows; ++r) {
+                    if (permutation.perm[r] >= rows)
+                        throw std::runtime_error(
+                            "Parameter '" + name + "': permutation out of range");
+
+                    std::copy(
+                        x.begin() + permutation.perm[r] * row_bytes,
+                        x.begin() + (permutation.perm[r] + 1) * row_bytes,
+                        out.begin() + r * row_bytes);
+                }
+            } else {
+                for (size_t r = 0; r < rows; ++r) {
+                    for (size_t j = 0; j < cols; ++j) {
+                        if (permutation.perm[j] >= cols)
+                            throw std::runtime_error(
+                                "Parameter '" + name + "': permutation out of range");
+
+                        std::copy(
+                            x.begin() + r * row_bytes + permutation.perm[j] * element_bytes,
+                            x.begin() + r * row_bytes + (permutation.perm[j] + 1) * element_bytes,
+                            out.begin() + r * row_bytes + j * element_bytes);
+                    }
+                }
+            }
+
+            return out;
+        }
+
         Context& context_;
         const ArgumentParser& args_;
         std::string prefix_;

@@ -4,7 +4,6 @@
 #include "nn/ModuleList.hpp"
 #include "nn/Linear.hpp"
 #include "nn/Dropout.hpp"
-#include "nn/PermutedParameter.hpp"
 #include "nn/modules/normalization/LayerNorm.hpp"
 #include "nn/modules/normalization/RMSNorm.hpp"
 #include "diffusers/models/transformers/flux2/Flux2PosEmbed.hpp"
@@ -40,27 +39,43 @@ public:
 
         //
         // MROPE head layout (see Flux2PosEmbed): the q/k projections
-        // and the QK-norm weights are PermutedParameters -- the loader
-        // permutes them into the ggml MROPE (NEOX) layout once at load
-        // time, so attention runs the whole head dimension through one
-        // MROPE op. v and the output projections stay in the original
-        // layout (the attention output is invariant under the same
-        // permutation of q and k).
+        // and the QK-norm weights carry a permutation configuration
+        // (Parameter::Permutation) -- the loader permutes them into the
+        // ggml MROPE (NEOX) layout once at load time, so attention runs
+        // the whole head dimension through one MROPE op. The q/k biases
+        // are permuted the same way as their weights. v and the output
+        // projections stay in the original layout (the attention output
+        // is invariant under the same permutation of q and k).
         //
         auto qk_rows_perm = Flux2PosEmbed::mrope_permutation(head_dim_, heads_);
         auto norm_perm = Flux2PosEmbed::mrope_permutation(head_dim_);
 
-        modules["to_q"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias,
-            std::make_shared<PermutedParameter>(Tensor::Shape({inner_dim_, query_dim_}), PermutedParameter::Axis::Rows, qk_rows_perm));
-        modules["to_k"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias,
-            std::make_shared<PermutedParameter>(Tensor::Shape({inner_dim_, query_dim_}), PermutedParameter::Axis::Rows, qk_rows_perm));
+        auto to_q = std::make_shared<Linear>(query_dim_, inner_dim_, bias);
+        to_q->weight()->permute_rows(qk_rows_perm);
+
+        if (bias)
+            to_q->bias()->permute_elements(qk_rows_perm);
+
+        modules["to_q"] = to_q;
+
+        auto to_k = std::make_shared<Linear>(query_dim_, inner_dim_, bias);
+        to_k->weight()->permute_rows(qk_rows_perm);
+
+        if (bias)
+            to_k->bias()->permute_elements(qk_rows_perm);
+
+        modules["to_k"] = to_k;
+
         modules["to_v"] = std::make_shared<Linear>(query_dim_, inner_dim_, bias);
 
         // QK Norm
-        modules["norm_q"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine,
-            std::make_shared<PermutedParameter>(Tensor::Shape({dim_head}), PermutedParameter::Axis::Elements, norm_perm));
-        modules["norm_k"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine,
-            std::make_shared<PermutedParameter>(Tensor::Shape({dim_head}), PermutedParameter::Axis::Elements, norm_perm));
+        auto norm_q_weight = std::make_shared<Parameter>(Tensor::Shape({dim_head}));
+        norm_q_weight->permute_elements(norm_perm);
+        modules["norm_q"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine, norm_q_weight);
+
+        auto norm_k_weight = std::make_shared<Parameter>(Tensor::Shape({dim_head}));
+        norm_k_weight->permute_elements(norm_perm);
+        modules["norm_k"] = std::make_shared<RMSNorm>(dim_head, eps, elementwise_affine, norm_k_weight);
 
         // Output projection
         modules["to_out"] = std::shared_ptr<ModuleList>(new ModuleList({
@@ -69,14 +84,30 @@ public:
         }));
         
         if (added_kv_proj_dim_) {
-            modules["norm_added_q"] = std::make_shared<RMSNorm>(dim_head, eps, true,
-                std::make_shared<PermutedParameter>(Tensor::Shape({dim_head}), PermutedParameter::Axis::Elements, norm_perm));
-            modules["norm_added_k"] = std::make_shared<RMSNorm>(dim_head, eps, true,
-                std::make_shared<PermutedParameter>(Tensor::Shape({dim_head}), PermutedParameter::Axis::Elements, norm_perm));
-            modules["add_q_proj"] = std::make_shared<Linear>(added_kv_proj_dim_.value(), inner_dim_, added_proj_bias_,
-                std::make_shared<PermutedParameter>(Tensor::Shape({inner_dim_, added_kv_proj_dim_.value()}), PermutedParameter::Axis::Rows, qk_rows_perm));
-            modules["add_k_proj"] = std::make_shared<Linear>(added_kv_proj_dim_.value(), inner_dim_, added_proj_bias_,
-                std::make_shared<PermutedParameter>(Tensor::Shape({inner_dim_, added_kv_proj_dim_.value()}), PermutedParameter::Axis::Rows, qk_rows_perm));
+            auto norm_added_q_weight = std::make_shared<Parameter>(Tensor::Shape({dim_head}));
+            norm_added_q_weight->permute_elements(norm_perm);
+            modules["norm_added_q"] = std::make_shared<RMSNorm>(dim_head, eps, true, norm_added_q_weight);
+
+            auto norm_added_k_weight = std::make_shared<Parameter>(Tensor::Shape({dim_head}));
+            norm_added_k_weight->permute_elements(norm_perm);
+            modules["norm_added_k"] = std::make_shared<RMSNorm>(dim_head, eps, true, norm_added_k_weight);
+
+            auto add_q_proj = std::make_shared<Linear>(added_kv_proj_dim_.value(), inner_dim_, added_proj_bias_);
+            add_q_proj->weight()->permute_rows(qk_rows_perm);
+
+            if (added_proj_bias_)
+                add_q_proj->bias()->permute_elements(qk_rows_perm);
+
+            modules["add_q_proj"] = add_q_proj;
+
+            auto add_k_proj = std::make_shared<Linear>(added_kv_proj_dim_.value(), inner_dim_, added_proj_bias_);
+            add_k_proj->weight()->permute_rows(qk_rows_perm);
+
+            if (added_proj_bias_)
+                add_k_proj->bias()->permute_elements(qk_rows_perm);
+
+            modules["add_k_proj"] = add_k_proj;
+
             modules["add_v_proj"] = std::make_shared<Linear>(added_kv_proj_dim_.value(), inner_dim_, added_proj_bias_);
             modules["to_add_out"] = std::make_shared<Linear>(inner_dim_, query_dim_, out_bias);
         }

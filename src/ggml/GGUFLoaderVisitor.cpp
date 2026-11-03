@@ -1,11 +1,7 @@
 #include "ggml/GGUFLoaderVisitor.hpp"
 #include "ggml/Context.hpp"
 #include "nn/Parameter.hpp"
-#include "nn/PermutedParameter.hpp"
 #include "nn/ModulePath.hpp"
-#include "diffusers/models/transformers/flux2/Flux2FusedQKVProjection.hpp"
-#include "diffusers/models/transformers/flux2/Flux2FusedAttentionOutput.hpp"
-#include "diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp"
 #include <string>
 #include <fstream>
 #include <iostream>
@@ -96,8 +92,8 @@ static Context::Provider<std::byte> read_cols(
     };
 }
 
-// Reorders the raw bytes of a freshly loaded weight into the MROPE
-// head layout (see PermutedParameter / Flux2PosEmbed):
+// Reorders the raw bytes of a freshly loaded weight according to its
+// permutation configuration (see Parameter::Permutation):
 //
 //   Rows:     output row j = input row perm[j] -- a pure byte reorder,
 //             exact for every storage type.
@@ -111,13 +107,12 @@ static Context::Provider<std::byte> permute_parameter(
     ggml_type type,
     int64_t rows,
     int64_t cols,
-    PermutedParameter::Axis axis,
-    const std::vector<size_t>& perm,
+    const Parameter::Permutation& permutation,
     const std::string& name)
 {
     size_t element_bytes = 0;
 
-    if (axis == PermutedParameter::Axis::Elements) {
+    if (permutation.axis == Parameter::Permutation::Axis::Elements) {
         switch (type) {
             case GGML_TYPE_F32:    element_bytes = 4; break;
             case GGML_TYPE_F16:
@@ -125,7 +120,7 @@ static Context::Provider<std::byte> permute_parameter(
             default:
                 throw std::runtime_error(
                     "Error while loading Tensor '" + name +
-                    "': MROPE element permutation is not supported for type " +
+                    "': element permutation is not supported for type " +
                     std::string(ggml_type_name(type)));
         }
     }
@@ -134,32 +129,34 @@ static Context::Provider<std::byte> permute_parameter(
         auto buf = provider(rng);
         auto row_bytes = static_cast<size_t>(ggml_row_size(type, cols));
 
-        if (perm.size() != static_cast<size_t>(axis == PermutedParameter::Axis::Rows ? rows : cols))
+        if (permutation.perm.size() != static_cast<size_t>(permutation.axis == Parameter::Permutation::Axis::Rows ? rows : cols))
             throw std::runtime_error(
                 "Error while loading Tensor '" + name +
-                "': MROPE permutation size mismatch");
+                "': permutation size mismatch");
 
         std::vector<std::byte> out(buf.size());
 
-        for (size_t r = 0; r < rows; ++r) {
-            if (axis == PermutedParameter::Axis::Rows) {
-                if (r >= perm.size() || perm[r] >= static_cast<size_t>(rows))
+        if (permutation.axis == Parameter::Permutation::Axis::Rows) {
+            for (size_t r = 0; r < rows; ++r) {
+                if (r >= permutation.perm.size() || permutation.perm[r] >= static_cast<size_t>(rows))
                     throw std::runtime_error(
-                        "Error while loading Tensor '" + name + "': MROPE permutation out of range");
+                        "Error while loading Tensor '" + name + "': permutation out of range");
 
                 std::copy(
-                    buf.begin() + perm[r] * row_bytes,
-                    buf.begin() + (perm[r] + 1) * row_bytes,
+                    buf.begin() + permutation.perm[r] * row_bytes,
+                    buf.begin() + (permutation.perm[r] + 1) * row_bytes,
                     out.begin() + r * row_bytes);
-            } else {
+            }
+        } else {
+            for (size_t r = 0; r < rows; ++r) {
                 for (size_t j = 0; j < cols; ++j) {
-                    if (perm[j] >= static_cast<size_t>(cols))
+                    if (permutation.perm[j] >= static_cast<size_t>(cols))
                         throw std::runtime_error(
-                            "Error while loading Tensor '" + name + "': MROPE permutation out of range");
+                            "Error while loading Tensor '" + name + "': permutation out of range");
 
                     std::copy(
-                        buf.begin() + r * row_bytes + perm[j] * element_bytes,
-                        buf.begin() + r * row_bytes + (perm[j] + 1) * element_bytes,
+                        buf.begin() + r * row_bytes + permutation.perm[j] * element_bytes,
+                        buf.begin() + r * row_bytes + (permutation.perm[j] + 1) * element_bytes,
                         out.begin() + r * row_bytes + j * element_bytes);
                 }
             }
@@ -352,185 +349,111 @@ GGUFLoaderVisitor::TensorBytes GGUFLoaderVisitor::load_tensor_bytes(
 
 void GGUFLoaderVisitor::visit(Parameter& parameter, std::vector<std::string> path) {
     ModulePath module_path;
-    auto load = load_tensor_bytes(module_path(path), parameter.shape());
+
+    // A split parameter (see Parameter::Split): its bytes live in a
+    // fused checkpoint tensor, not at its own path.
+    auto load = parameter.split()
+        ? load_split(parameter, path, *parameter.split())
+        : load_tensor_bytes(module_path(path), parameter.shape());
+
+    auto provider = load.provider;
+
+    // A permuted parameter (see Parameter::Permutation): load the raw
+    // GGUF bytes, then reorder them according to the configuration.
+    // A split parameter is permuted after the slice.
+    if (auto permutation = parameter.permutation()) {
+        auto shape = parameter.shape();
+        auto cols = shape[shape.rank() - 1];
+        auto rows = 1;
+
+        for (auto r = 0; r + 1 < shape.rank(); ++r)
+            rows *= shape[r];
+
+        provider = permute_parameter(provider, load.type, rows, cols, *permutation, load.name);
+    }
 
     Scope scope(context_);
     auto tensor = Tensor::empty(parameter.shape(), load.type);
 
     tensor.name(load.name);
 
-    context_.bind<std::byte>(tensor, load.provider, /*once=*/true);
+    context_.bind<std::byte>(tensor, provider, /*once=*/true);
 
     parameter.set(tensor);
 }
 
-void GGUFLoaderVisitor::visit(PermutedParameter& parameter, std::vector<std::string> path) {
+GGUFLoaderVisitor::TensorBytes GGUFLoaderVisitor::load_split(
+    const Parameter& parameter,
+    const std::vector<std::string>& path,
+    const Parameter::Split& split)
+{
     ModulePath module_path;
-    auto model_path = module_path(path);
-    auto load = load_tensor_bytes(model_path, parameter.shape());
+
+    auto fused_name = module_path(parameter.split_fused_path(path));
+
+    auto fused = load_fused(fused_name);
+
+    // The slice is named after its fused tensor and the parameter:
+    // "...to_qkv_mlp_proj.weight-q-weight".
+    auto name = fused_name + "-" + path[path.size() - 2] + "-" + path[path.size() - 1];
 
     auto shape = parameter.shape();
-    auto cols = shape[shape.rank() - 1];
-    auto rows = 1;
 
-    for (auto r = 0; r + 1 < shape.rank(); ++r)
-        rows *= shape[r];
+    if (split.axis == Parameter::Split::Axis::Rows) {
+        if (shape.rank() != 2)
+            throw std::runtime_error(
+                "Error while loading Tensor '" + module_path(path) +
+                "': a row split requires a 2-D parameter, got " + shape.to_string());
 
-    Scope scope(context_);
-    auto tensor = Tensor::empty(shape, load.type);
+        if (split.end > static_cast<size_t>(fused.rows))
+            throw std::runtime_error(
+                "Error while loading Tensor '" + module_path(path) +
+                "': the row split [" + std::to_string(split.start) + ", " + std::to_string(split.end) +
+                ") of '" + fused_name + "' is out of bounds (the fused tensor has " +
+                std::to_string(fused.rows) + " rows)");
 
-    tensor.name(load.name);
+        auto expected = Tensor::Shape({static_cast<int64_t>(split.end - split.start), fused.cols});
 
-    // Load the raw GGUF bytes, then reorder them into the MROPE head
-    // layout (see PermutedParameter).
-    context_.bind<std::byte>(
-        tensor,
-        permute_parameter(load.provider, load.type, rows, cols, parameter.axis(), parameter.perm(), model_path),
-        /*once=*/true);
+        if (shape != expected)
+            throw std::runtime_error(
+                "Error while loading Tensor '" + module_path(path) +
+                "': Parameter shape mismatch: expected " + expected.to_string() +
+                ", got " + shape.to_string());
 
-    parameter.set(tensor);
-}
-
-void GGUFLoaderVisitor::visit(Flux2FusedQKVProjection& to_qkv_mlp_proj, std::vector<std::string> path) {
-    ModulePath module_path;
-    auto weight_path = module_path(path, {}, {"weight"});
-
-    auto weight = load_tensor(weight_path);
-
-    auto q_weight = to_qkv_mlp_proj.q()->weight();
-    auto k_weight = to_qkv_mlp_proj.k()->weight();
-    auto v_weight = to_qkv_mlp_proj.v()->weight();
-    auto mlp_in_gate_weight = to_qkv_mlp_proj.mlp_in_gate()->weight();
-    auto mlp_in_up_weight = to_qkv_mlp_proj.mlp_in_up()->weight();
-
-    auto inner = to_qkv_mlp_proj.inner_dim();
-    auto mlp_out = to_qkv_mlp_proj.mlp_out_dim();
-
-    // The MLP input projection is split into gate and up, each with
-    // mlp_out / 2 output features: the first half of the fused MLP rows
-    // is the gate, the second half the up projection (the reference
-    // chunks the fused output down the middle in Flux2SwiGLU).
-    auto mlp_hidden = mlp_in_gate_weight->shape()[0];
-
-    // The fused weight is (3 * inner + mlp_out) x query_dim, so rows
-    // of the flattened data are query_dim elements long.
-    auto query_dim = q_weight->shape()[1];
-
-    if (weight.rows != 3 * inner + mlp_out || weight.cols != query_dim)
-        throw std::runtime_error(
-            "Error while loading Tensor '" + weight_path +
-            "': Parameter shape mismatch: expected " +
-            Tensor::Shape({3 * inner + mlp_out, query_dim}).to_string() +
-            ", got " + Tensor::Shape({weight.rows, weight.cols}).to_string());
-
-    // The q/k weights may be PermutedParameters (see Flux2ParallelSelf-
-    // Attention): their rows are permuted into the MROPE head layout at
-    // load time.
-    auto q_provider = read_rows(file_, weight, 0, inner, weight_path + "-q-weight");
-    auto k_provider = read_rows(file_, weight, inner, 2 * inner, weight_path + "-k-weight");
-
-    if (auto q_mrope = std::dynamic_pointer_cast<PermutedParameter>(q_weight))
-        q_provider = permute_parameter(q_provider, weight.type, inner, query_dim, q_mrope->axis(), q_mrope->perm(), weight_path + "-q-weight");
-
-    if (auto k_mrope = std::dynamic_pointer_cast<PermutedParameter>(k_weight))
-        k_provider = permute_parameter(k_provider, weight.type, inner, query_dim, k_mrope->axis(), k_mrope->perm(), weight_path + "-k-weight");
-
-    q_weight->set(create_weight(context_, weight_path + "-q-weight", q_weight->shape(), weight.type, q_provider));
-
-    k_weight->set(create_weight(context_, weight_path + "-k-weight", k_weight->shape(), weight.type, k_provider));
-
-    v_weight->set(create_weight(context_, weight_path + "-v-weight", v_weight->shape(), weight.type,
-        read_rows(file_, weight, 2 * inner, 3 * inner, weight_path + "-v-weight")));
-
-    mlp_in_gate_weight->set(create_weight(context_, weight_path + "-mlp_in_gate-weight", mlp_in_gate_weight->shape(), weight.type,
-        read_rows(file_, weight, 3 * inner, 3 * inner + mlp_hidden, weight_path + "-mlp_in_gate-weight")));
-
-    mlp_in_up_weight->set(create_weight(context_, weight_path + "-mlp_in_up-weight", mlp_in_up_weight->shape(), weight.type,
-        read_rows(file_, weight, 3 * inner + mlp_hidden, 3 * inner + mlp_out, weight_path + "-mlp_in_up-weight")));
-}
-
-void GGUFLoaderVisitor::visit(Flux2FusedAttentionOutput& to_out, std::vector<std::string> path) {
-    ModulePath module_path;
-
-    auto weight_path = module_path(path, {}, {"weight"});
-
-    auto weight = load_tensor(weight_path);
-
-    auto attn_weight = to_out.attn()->weight();
-    auto mlp_weight = to_out.mlp()->weight();
-
-    auto inner = to_out.inner_dim();
-    auto mlp_hidden = to_out.mlp_hidden_dim();
-
-    // The fused weight is (out_dim) x (inner + mlp_hidden) in the
-    // PyTorch (out_features, in_features) layout.
-    auto out_dim = attn_weight->shape()[0];
-
-    if (weight.rows != out_dim || weight.cols != inner + mlp_hidden)
-        throw std::runtime_error(
-            "Error while loading Tensor '" + weight_path +
-            "': Parameter shape mismatch: expected " +
-            Tensor::Shape({out_dim, inner + mlp_hidden}).to_string() +
-            ", got " + Tensor::Shape({weight.rows, weight.cols}).to_string());
-
-    attn_weight->set(create_weight(context_, weight_path + "-attn-weight", attn_weight->shape(), weight.type,
-        read_cols(file_, weight, 0, inner, weight_path + "-attn-weight")));
-
-    mlp_weight->set(create_weight(context_, weight_path + "-mlp-weight", mlp_weight->shape(), weight.type,
-        read_cols(file_, weight, inner, inner + mlp_hidden, weight_path + "-mlp-weight")));
-
-    auto attn_bias = to_out.attn()->bias();
-
-    if (attn_bias) {
-        auto bias_path = path;
-        bias_path.push_back("bias");
-        visit(*attn_bias, std::move(bias_path));
+        return { fused.type, name, read_rows(file_, fused, split.start, split.end, name) };
     }
+
+    if (shape.rank() > 2)
+        throw std::runtime_error(
+            "Error while loading Tensor '" + module_path(path) +
+            "': a column split requires a 1-D or 2-D parameter, got " + shape.to_string());
+
+    if (split.end > static_cast<size_t>(fused.cols))
+        throw std::runtime_error(
+            "Error while loading Tensor '" + module_path(path) +
+            "': the column split [" + std::to_string(split.start) + ", " + std::to_string(split.end) +
+            ") of '" + fused_name + "' is out of bounds (the fused tensor has " +
+            std::to_string(fused.cols) + " columns)");
+
+    auto expected = shape.rank() == 2
+        ? Tensor::Shape({fused.rows, static_cast<int64_t>(split.end - split.start)})
+        : Tensor::Shape({static_cast<int64_t>(split.end - split.start)});
+
+    if (shape != expected)
+        throw std::runtime_error(
+            "Error while loading Tensor '" + module_path(path) +
+            "': Parameter shape mismatch: expected " + expected.to_string() +
+            ", got " + shape.to_string());
+
+    return { fused.type, name, read_cols(file_, fused, split.start, split.end, name) };
 }
 
-void GGUFLoaderVisitor::visit(Flux2FusedLinearIn& linear_in, std::vector<std::string> path) {
-    ModulePath module_path;
-    auto weight_path = module_path(path, {}, {"weight"});
+GGUFLoaderVisitor::TensorInfo GGUFLoaderVisitor::load_fused(const std::string& name) {
+    if (auto it = fused_.find(name); it != fused_.end())
+        return it->second;
 
-    auto weight = load_tensor(weight_path);
+    auto info = load_tensor(name);
+    auto result = fused_.emplace(name, info);
 
-    auto gate_weight = linear_in.gate()->weight();
-    auto up_weight = linear_in.up()->weight();
-
-    // The fused linear_in weight is (inner * 2) x dim (PyTorch layout).
-    // The first inner rows are the gate projection, the last inner rows
-    // the up projection (the reference chunks the fused output down the
-    // middle in Flux2SwiGLU).
-    auto inner = linear_in.inner_dim();
-    auto dim = linear_in.dim();
-
-    if (weight.rows != inner * 2 || weight.cols != dim)
-        throw std::runtime_error(
-            "Error while loading Tensor '" + weight_path +
-            "': Parameter shape mismatch: expected " +
-            Tensor::Shape({inner * 2, dim}).to_string() +
-            ", got " + Tensor::Shape({weight.rows, weight.cols}).to_string());
-
-    gate_weight->set(create_weight(context_, weight_path + "-gate-weight", gate_weight->shape(), weight.type,
-        read_rows(file_, weight, 0, inner, weight_path + "-gate-weight")));
-
-    up_weight->set(create_weight(context_, weight_path + "-up-weight", up_weight->shape(), weight.type,
-        read_rows(file_, weight, inner, inner * 2, weight_path + "-up-weight")));
-
-    auto gate_bias = linear_in.gate()->bias();
-
-    if (gate_bias) {
-        auto bias_path = module_path(path, {}, {"bias"});
-        auto bias = load_tensor(bias_path);
-
-        auto up_bias = linear_in.up()->bias();
-
-        // The fused bias is 1-D of length inner * 2; the first inner
-        // elements belong to the gate, the last inner to the up.
-        gate_bias->set(create_weight(context_, bias_path + "-gate-bias", gate_bias->shape(), bias.type,
-            read_cols(file_, bias, 0, inner, bias_path + "-gate-bias")));
-
-        up_bias->set(create_weight(context_, bias_path + "-up-bias", up_bias->shape(), bias.type,
-            read_cols(file_, bias, inner, inner * 2, bias_path + "-up-bias")));
-    }
+    return result.first->second;
 }

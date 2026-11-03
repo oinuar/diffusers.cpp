@@ -23,39 +23,7 @@ struct ArgumentParser::parser<Tensor> {
         try {
             auto [shape, data] = parser.parse();
 
-            Tensor tensor;
-
-            switch (dtype_) {
-            case Tensor::DType<int64_t>::value:
-                tensor = scope_.context().create<int64_t>(shape, [data = std::move(data)](std::mt19937&) {
-                    return std::vector<int64_t>(data.begin(), data.end());
-                });
-                break;
-
-            case Tensor::DType<int32_t>::value:
-                tensor = scope_.context().create<int32_t>(shape, [data = std::move(data)](std::mt19937&) {
-                    return std::vector<int32_t>(data.begin(), data.end());
-                });
-                break;
-
-            case Tensor::DType<int16_t>::value:
-                tensor = scope_.context().create<int16_t>(shape, [data = std::move(data)](std::mt19937&) {
-                    return std::vector<int16_t>(data.begin(), data.end());
-                });
-                break;
-
-            case Tensor::DType<int8_t>::value:
-                tensor = scope_.context().create<int8_t>(shape, [data = std::move(data)](std::mt19937&) {
-                    return std::vector<int8_t>(data.begin(), data.end());
-                });
-                break;
-
-            default:
-                tensor = scope_.context().create<float>(shape, [data = std::move(data)](std::mt19937&) {
-                    return data;
-                });
-                break;
-            }
+            auto tensor = create(scope_.context(), shape, std::move(data), dtype_);
 
             tensor.name(option.c_str());
 
@@ -63,6 +31,47 @@ struct ArgumentParser::parser<Tensor> {
         } catch (const std::runtime_error& error) {
             throw std::runtime_error("invalid argument " + option + ": " + error.what());
         }
+    }
+
+    /** @brief Creates a tensor of the given dtype from the parsed
+     *  (float) values, the way the visitors bind parameter values.
+     */
+    static Tensor create(Context& context, const Tensor::Shape& shape, std::vector<float> data, const ggml_type& dtype) {
+        Tensor tensor;
+
+        switch (dtype) {
+        case Tensor::DType<int64_t>::value:
+            tensor = context.create<int64_t>(shape, [data = std::move(data)](std::mt19937&) {
+                return std::vector<int64_t>(data.begin(), data.end());
+            });
+            break;
+
+        case Tensor::DType<int32_t>::value:
+            tensor = context.create<int32_t>(shape, [data = std::move(data)](std::mt19937&) {
+                return std::vector<int32_t>(data.begin(), data.end());
+            });
+            break;
+
+        case Tensor::DType<int16_t>::value:
+            tensor = context.create<int16_t>(shape, [data = std::move(data)](std::mt19937&) {
+                return std::vector<int16_t>(data.begin(), data.end());
+            });
+            break;
+
+        case Tensor::DType<int8_t>::value:
+            tensor = context.create<int8_t>(shape, [data = std::move(data)](std::mt19937&) {
+                return std::vector<int8_t>(data.begin(), data.end());
+            });
+            break;
+
+        default:
+            tensor = context.create<float>(shape, [data = std::move(data)](std::mt19937&) {
+                return data;
+            });
+            break;
+        }
+
+        return tensor;
     }
 
 private:

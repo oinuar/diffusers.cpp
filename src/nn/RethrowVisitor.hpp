@@ -8,7 +8,6 @@
 #include "nn/Visitor.hpp"
 
 class Parameter;
-class PermutedParameter;
 class Module;
 
 class RethrowVisitor : public Visitor {
@@ -21,31 +20,7 @@ public:
         });
     }
 
-    void visit(PermutedParameter& parameter, std::vector<std::string> path) override {
-        visitWithCatch([&] {
-            parent_.visit(parameter, std::move(path));
-        });
-    }
-
     void visit(Module& module, std::vector<std::string> path) override {
-        visitWithCatch([&] {
-            parent_.visit(module, std::move(path));
-        });
-    }
-
-    void visit(Flux2FusedQKVProjection& module, std::vector<std::string> path) override {
-        visitWithCatch([&] {
-            parent_.visit(module, std::move(path));
-        });
-    }
-
-    void visit(Flux2FusedAttentionOutput& module, std::vector<std::string> path) override {
-        visitWithCatch([&] {
-            parent_.visit(module, std::move(path));
-        });
-    }
-
-    void visit(Flux2FusedLinearIn& module, std::vector<std::string> path) override {
         visitWithCatch([&] {
             parent_.visit(module, std::move(path));
         });

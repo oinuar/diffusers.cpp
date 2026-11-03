@@ -5,7 +5,6 @@
 #include "ggml/Scope.hpp"
 #include "ggml/Runtime.hpp"
 #include "diffusers/models/transformers/flux2/Flux2SwiGLU.hpp"
-#include "diffusers/models/transformers/flux2/Flux2FusedLinearIn.hpp"
 
 class Flux2FeedForward : public Module {
 private:
@@ -19,11 +18,28 @@ private:
         sharded_(Scope::active() && Scope::runtime().use_sharding())
     {
         if (sharded_) {
-            // Sharding patch: the reference's fused linear_in Linear is
-            // replaced by split gate/up projections (see
-            // Flux2FusedLinearIn), so the reference's chunk of its
-            // output does not apply.
-            modules["linear_in"] = std::make_shared<Flux2FusedLinearIn>(dim, inner_dim, bias);
+            // Sharding patch: the reference's fused linear_in Linear
+            // is replaced by split gate/up projections whose weight/bias
+            // Parameters carry split configurations (see
+            // Parameter::Split): the loaders take each slice from the
+            // fused checkpoint tensors.
+            auto gate = std::make_shared<Linear>(dim, inner_dim, bias);
+
+            gate->weight()->split_rows({"linear_in", "weight"}, 0, inner_dim);
+
+            if (bias)
+                gate->bias()->split_cols({"linear_in", "bias"}, 0, inner_dim);
+
+            modules["gate"] = gate;
+
+            auto up = std::make_shared<Linear>(dim, inner_dim, bias);
+
+            up->weight()->split_rows({"linear_in", "weight"}, inner_dim, inner_dim * 2);
+
+            if (bias)
+                up->bias()->split_cols({"linear_in", "bias"}, inner_dim, inner_dim * 2);
+
+            modules["up"] = up;
         } else {
             // Reference form: one fused projection over (gate | up)
             // features; the SwiGLU chunks its output.
@@ -62,11 +78,14 @@ public:
         auto linear_out = std::static_pointer_cast<Linear>(modules["linear_out"]);
 
         if (sharded_) {
-            auto linear_in = std::static_pointer_cast<Flux2FusedLinearIn>(modules["linear_in"]);
+            // Sharding patch: the reference's fused linear_in is
+            // replaced by split gate/up projections (see the split
+            // Parameter configurations in the constructor), so the
+            // reference's chunk of its output does not apply.
+            auto gate = std::static_pointer_cast<Linear>(modules["gate"]);
+            auto up = std::static_pointer_cast<Linear>(modules["up"]);
 
-            auto [gate, up] = linear_in->forward(scope, x);
-
-            x = act_fn->forward(scope, gate, up);
+            x = act_fn->forward(scope, gate->forward(scope, x), up->forward(scope, x));
         } else {
             auto linear_in = std::static_pointer_cast<Linear>(modules["linear_in"]);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nn/Visitor.hpp"
+#include "nn/Parameter.hpp"
 #include "ggml/Context.hpp"
 #include <unordered_map>
 #include <string>
@@ -11,7 +12,6 @@
 
 class Context;
 class Parameter;
-class PermutedParameter;
 
 class GGUFLoaderVisitor : public Visitor {
 public:
@@ -28,10 +28,6 @@ public:
     ~GGUFLoaderVisitor();
 
     void visit(Parameter& parameter, std::vector<std::string> path) override;
-    void visit(PermutedParameter& parameter, std::vector<std::string> path) override;
-    void visit(Flux2FusedQKVProjection& to_qkv_mlp_proj, std::vector<std::string> path) override;
-    void visit(Flux2FusedAttentionOutput& to_out, std::vector<std::string> path) override;
-    void visit(Flux2FusedLinearIn& linear_in, std::vector<std::string> path) override;
 
     void validate() const;
 
@@ -58,8 +54,21 @@ private:
 
     TensorBytes load_tensor_bytes(const std::string& model_path, const Tensor::Shape& expected_shape);
 
+    // Describes the slice of a fused tensor a split parameter holds
+    // (see Parameter::Split): validates the slice against the fused
+    // tensor and returns its type, a name and a one-shot provider for
+    // the slice's raw bytes.
+    TensorBytes load_split(const Parameter& parameter, const std::vector<std::string>& path, const Parameter::Split& split);
+
+    // Looks up the fused tensor a split parameter references (see
+    // load_split), caching the result: several split parameters can
+    // reference the same fused tensor (q, k and v are all slices of
+    // the same fused projection).
+    TensorInfo load_fused(const std::string& name);
+
     Context& context_;
     gguf_context* gguf_ctx_;
     std::shared_ptr<std::ifstream> file_;
     std::unordered_map<std::string, size_t> lookup_;
+    std::unordered_map<std::string, TensorInfo> fused_;
 };

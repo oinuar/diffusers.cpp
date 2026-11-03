@@ -15,7 +15,7 @@
 // rotating adjacent pairs (2l, 2l+1) within the axis. MROPE instead
 // pairs (p, p + D/2) with the position of the sector p/sectors-per-axis.
 // The two are identical after the even/odd (NEOX) head-dim permutation
-// P, applied to the q/k weights once at load time (PermutedParameter):
+// P, applied to the q/k weights once at load time (Parameter::Permutation):
 //
 //   MROPE pair j          = (x[j], x[j + D/2])   in MROPE layout
 //   Flux2 pair (2j, 2j+1) = the same two values  in the original layout
@@ -42,7 +42,7 @@ public:
 
     // x: (batch, seq, heads, head_dim) in the MROPE head layout (the
     // q/k projection weights are pre-permuted at load time, see
-    // PermutedParameter).
+    // Parameter::Permutation).
     //
     // position_ids: (4, seq) int32 -- the four position blocks
     // [T, H, W, L] transposed to one block per axis (the joint
