@@ -2,6 +2,7 @@
 
 #include "ggml/Runtime.hpp"
 #include "ggml/Computation.hpp"
+#include <utility>
 
 class Device;
 class ShardingRuntime;
@@ -13,6 +14,25 @@ public:
     static ExecutionRuntime Default;
 
     // Executes the computation in one pass and returns its final value.
+    //
+    // backends maps every pinned (weights) context to the backend the
+    // weights are loaded on. Each scope's graph runs on the backend of
+    // the weights it consumes: a scope whose graph leaves (directly, or
+    // through a view) all live in the pinned contexts of a single
+    // backend runs on that backend; a scope with no pinned leaves (one
+    // that only moves state values around) runs on the CPU; a scope
+    // whose leaves span several backends is an error -- the user must
+    // restructure the computation so every scope's weights live on one
+    // backend.
+    //
+    // All the state values live on the CPU for the whole run: the state
+    // context is allocated on the CPU, a state cell a scope's graph
+    // reads is bound to a scope-local input of the scope context (the
+    // binding copies the cell's current value before every execution of
+    // the scope), and the values the scopes persist (the saves) are
+    // copied back into the state context after every execution. Since
+    // no state tensor crosses a scope boundary inside a graph, the
+    // scopes may run on different backends.
     //
     // Memory management is part of the execution: the pinned (weights)
     // contexts and the state context are allocated once, on the first
@@ -27,14 +47,20 @@ public:
     // caller reads after the scope contexts are freed -- and allocated
     // here with the rest of the state context.
     template <class T>
-    T run(Backend& backend, std::mt19937& rng, Computation<T> computation, ShardingRuntime* sharding = nullptr, ProgressBar* progress = nullptr) const {
+    T run(
+        const std::vector<std::pair<Context*, Backend*>>& backends,
+        std::mt19937& rng,
+        Computation<T> computation,
+        ShardingRuntime* sharding = nullptr,
+        ProgressBar* progress = nullptr
+    ) const {
         // The caller still holds the returned value after run() returns,
         // when the scope contexts are already freed: the final value is
         // an implicit dereference, materialized into the state context
         // like every other dereferenced value.
         auto value = *computation;
 
-        run(backend, rng, *computation.desc(), sharding, progress);
+        run(backends, rng, *computation.desc(), sharding, progress);
 
         return value;
     }
@@ -355,5 +381,11 @@ public:
 private:
     void bind(std::mt19937& rng, Context& context, bool once_only, std::vector<std::pair<ggml_tensor*, std::vector<std::byte>>>* snapshots = nullptr) const;
     void copy(const Tensor& src, const Tensor& dst) const;
-    void run(Backend& backend, std::mt19937& rng, ComputationDescription& desc, ShardingRuntime* sharding, ProgressBar* progress) const;
+    void run(
+        const std::vector<std::pair<Context*, Backend*>>& backends,
+        std::mt19937& rng,
+        ComputationDescription& desc,
+        ShardingRuntime* sharding,
+        ProgressBar* progress
+    ) const;
 };

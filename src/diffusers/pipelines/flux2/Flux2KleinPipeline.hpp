@@ -50,13 +50,10 @@ public:
     Flux2KleinPipeline(Flux2Transformer2DModel&& transformer,
                        AutoencoderKLFlux2&& vae,
                        Qwen3ForCausalLM&& text_encoder,
-                       Qwen2TokenizerFast&& tokenizer);
+                       Qwen2TokenizerFast&& tokenizer,
+                       Computation<void> computation);
     
-    Computation<Tensor> operator()(
-        Context& vae_context,
-        Context& text_encoder_context,
-        Context& transformer_context,
-        GenerationOptions&& options);
+    Computation<Tensor> operator()(GenerationOptions&& options);
 
     // Encodes reference images into packed latents (B, N, 4 * C), where N
     // is the sum of the packed token counts of all images. Returns
@@ -120,10 +117,15 @@ public:
     static Tensor patchify_latents(Tensor latents, int channels, int packed_h, int packed_w);
     static Tensor unpatchify_latents(Tensor latents, int channels, int packed_h, int packed_w);
 
+    Flux2KleinPipeline(Flux2KleinPipeline&&) = default;
+    Flux2KleinPipeline(const Flux2KleinPipeline&) = delete;
+    Flux2KleinPipeline& operator =(const Flux2KleinPipeline&) = delete;
+
 private:
     Flux2Transformer2DModel transformer_;
     AutoencoderKLFlux2 vae_;
     FlowMatchEulerDiscreteScheduler scheduler_;
     Qwen3ForCausalLM text_encoder_;
     Qwen2TokenizerFast tokenizer_;
+    Computation<void> computation_;
 };

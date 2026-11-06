@@ -264,26 +264,17 @@ Flux2KleinPipeline::Flux2KleinPipeline(
     Flux2Transformer2DModel&& transformer,
     AutoencoderKLFlux2&& vae,
     Qwen3ForCausalLM&& text_encoder,
-    Qwen2TokenizerFast&& tokenizer
+    Qwen2TokenizerFast&& tokenizer,
+    Computation<void> computation
 ) : transformer_(std::move(transformer)),
     vae_(std::move(vae)),
     text_encoder_(std::move(text_encoder)),
-    tokenizer_(std::move(tokenizer))
+    tokenizer_(std::move(tokenizer)),
+    computation_(computation)
 {
 }
 
-Computation<Tensor> Flux2KleinPipeline::operator()(
-    Context& vae_context,
-    Context& text_encoder_context,
-    Context& transformer_context,
-    GenerationOptions&& options)
-{
-    Computation<void> computation({
-        &vae_context,
-        &text_encoder_context,
-        &transformer_context
-    });
-
+Computation<Tensor> Flux2KleinPipeline::operator()(GenerationOptions&& options) {
     if (options.height % vae_.scale_factor() != 0 || options.width % vae_.scale_factor() != 0)
         throw std::runtime_error("height/width must be divisible by VAE's scale factor");
 
@@ -307,25 +298,25 @@ Computation<Tensor> Flux2KleinPipeline::operator()(
         img = preprocess_reference_image(img, vae_multiple);
 
     // 2. Encode images to latents.
-    auto image_latents = encode_images(computation, options.images, batch, options.encode_tile_size);
+    auto image_latents = encode_images(computation_, options.images, batch, options.encode_tile_size);
 
     // 3. Encode the prompt into text embeddings.
-    auto prompt_embeds = computation
+    auto prompt_embeds = computation_
         .scope([&](Scope scope) -> Tensor {
             return encode_prompt(scope, batch, options.prompt, options.max_sequence_length);
         });
 
     // 4. Generate RoPE embeddings.
-    auto img_ids = prepare_img_ids(computation.desc()->context(), batch, packed_h, packed_w);
-    auto txt_ids = prepare_txt_ids(computation.desc()->context(), batch, options.max_sequence_length);
+    auto img_ids = prepare_img_ids(computation_.desc()->context(), batch, packed_h, packed_w);
+    auto txt_ids = prepare_txt_ids(computation_.desc()->context(), batch, options.max_sequence_length);
     auto image_latent_ids = options.images.empty()
         ? std::nullopt
-        : std::make_optional(prepare_ref_image_ids(computation.desc()->context(), batch, options.images, vae_.scale_factor() * 2));
+        : std::make_optional(prepare_ref_image_ids(computation_.desc()->context(), batch, options.images, vae_.scale_factor() * 2));
 
     // 5. Create initial latents.
     auto latents = options.init_latents
-        ? make_init_latents(computation, batch, packed_h, packed_w, vae_.latent_channels(), std::move(*options.init_latents))
-        : make_packed_latents(computation, batch, packed_h, packed_w, vae_.latent_channels());
+        ? make_init_latents(computation_, batch, packed_h, packed_w, vae_.latent_channels(), std::move(*options.init_latents))
+        : make_packed_latents(computation_, batch, packed_h, packed_w, vae_.latent_channels());
 
     auto mu = compute_empirical_mu(image_seq_len, options.num_inference_steps);
     const int n = options.num_inference_steps;
@@ -622,7 +613,8 @@ Flux2KleinPipeline Flux2KleinPipeline::from_pretrained(Context& vae_context, Con
         std::move(transformer),
         std::move(vae),
         std::move(text_encoder),
-        std::move(tokenizer)
+        std::move(tokenizer),
+        Computation<void>({&vae_context, &text_encoder_context, &transformer_context})
     );
 
     return std::move(pipeline);

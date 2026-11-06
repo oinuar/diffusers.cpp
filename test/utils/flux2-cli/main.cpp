@@ -540,7 +540,8 @@ public:
                 std::move(transformer),
                 std::move(vae),
                 std::move(text_encoder),
-                std::move(tokenizer)
+                std::move(tokenizer),
+                computation
             );
 
             if (args_.get(0) == "Flux2KleinPipeline_vae_encode") {
@@ -637,7 +638,7 @@ public:
 
                 // The raw decoded values are converted to RGB images on the
                 // CPU side in run() (Computation<Image> is not supported).
-                return Computation<Tensor>::all(pipeline(context, context, context, std::move(options)));
+                return Computation<Tensor>::all(pipeline(std::move(options)));
             }
 
             throw std::runtime_error("Unknown command: " + args_.get(0));
@@ -656,11 +657,11 @@ public:
     // Flux2KleinPipeline_call returns the raw decoded values (B, 3, H, W).
     // Computation<Image> is not supported, so the conversion to RGB images
     // (H, W, 3) is performed on the CPU side after execution.
-    virtual int run(Backend& backend, Computation<std::vector<Tensor>> computation, ShardingRuntime* sharding = nullptr) override {
+    virtual int run(const std::vector<std::pair<Context*, Backend*>>& backends, Computation<std::vector<Tensor>> computation, ShardingRuntime* sharding = nullptr) override {
         if (args_.get(0) == "Flux2KleinPipeline_call") {
             std::mt19937 rng;
             //ProgressBar progress("Testing");
-            auto results = ExecutionRuntime::Default.run(backend, rng, computation, sharding);
+            auto results = ExecutionRuntime::Default.run(backends, rng, computation, sharding);
 
             if (results.size() != 1)
                 throw std::runtime_error("Flux2KleinPipeline_call: expected exactly one result tensor");
@@ -686,7 +687,7 @@ public:
             return EXIT_SUCCESS;
         }
 
-        return TestCLI::run(backend, computation, sharding);
+        return TestCLI::run(backends, computation, sharding);
     }
 
 };

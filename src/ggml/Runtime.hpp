@@ -11,10 +11,6 @@ public:
     // True when the runtime shards tensors across multiple devices.
     virtual bool use_sharding() const { return false; }
 
-    // True when the scope-boundary saves must be copied through host
-    // memory.
-    virtual bool use_host_copy() const { return false; }
-
     // -------------------------------------------------------------------------
     // Tensor creation / initialization
     // -------------------------------------------------------------------------

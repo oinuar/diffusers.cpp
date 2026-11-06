@@ -21,15 +21,16 @@
 //
 // A scope's temporary context is disposable: once the scope has executed,
 // its buffer is freed. The values that must survive the scopes are exactly
-// value is materialized into a persistent cell in the state context, and
-// the producing scope writes it there after every execution (a save,
-// materialized as a CPY node of the scope's graph).
+// the ones the computation dereferences (operator*): each is materialized
+// into a persistent cell in the state context, and the producing scope
+// writes it there after every execution (a save).
 
 // One value crossing a scope boundary: the value (in the producing
 // scope's context) is written into the persistent destination (a state
-// cell) by a CPY node of the producing scope's graph. The CPY node is a
-// view of the destination, so the write happens in the cell's own
-// storage, in place, on any backend (no host-side copy).
+// cell) with a host-side copy after every execution of the producing
+// scope. The state context lives on the CPU (see ExecutionRuntime::run),
+// so the scopes may run on different backends: no state tensor crosses a
+// scope boundary inside a graph.
 
 struct ComputationScope {
     struct Repeat {
@@ -491,11 +492,6 @@ public:
         
         r.outputs = next_values;
 
-        // Add CPY node if host-copies are not used in Runtime.
-        if (!scope.runtime().use_host_copy())
-            for (auto i = 0; i < next_values.size(); ++i)
-                r.outputs.push_back(Tensor(scope.runtime().cpy(*next_values[i], *curr_values[i]), next_values[i].shape()));
-
         for (auto i = 0; i < next_values.size(); ++i)
             r.saves.push_back({
                 next_values[i], // src
@@ -524,8 +520,9 @@ private:
     // persistent cell. The cell is allocated in the state context (the
     // temporarily active context; the active runtime is kept, so a
     // sharding runtime still traces the cell), and a save is registered
-    // in the producing scope: a CPY node of the scope's graph writes the
-    // value into the cell in place, after every execution of it. Every
+    // in the producing scope: a host-side copy writes the value into
+    // the cell after every execution of the scope (the state context
+    // lives on the CPU, see ExecutionRuntime::run). Every
     // materialization of the same value returns the same cell (the
     // Description deduplicates), and a value that already lives in a
     // persistent context (the state or a pinned context) is returned
@@ -545,12 +542,6 @@ private:
         // Create new state cell.
         Scope state_scope(desc_->context());
         auto cell = ComputationValue<Tensor>::state(value).name(value.name() + std::string(" (state)"));
-
-        // Add CPY node if host-copies are not used in Runtime.
-        if (!state_scope.runtime().use_host_copy()) {
-            Scope producer_scope(*scope->context);
-            scope->outputs.push_back(Tensor(state_scope.runtime().cpy(*value, *cell), value.shape()));
-        }
 
         scope->saves.push_back({
             value, // src

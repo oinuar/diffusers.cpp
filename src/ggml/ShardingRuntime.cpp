@@ -7,15 +7,6 @@ bool ShardingRuntime::use_sharding() const {
     return true;
 }
 
-bool ShardingRuntime::use_host_copy() const {
-
-    // The meta backend treats the meta buffer as a host buffer when
-    // every underlying device is a CPU. The scope-boundary saves must
-    // fall back to host-side copies.
-    return ggml_backend_buft_is_host(device_.buffer_type());
-}
-
-
 // ShardingRuntime candidate generation: exactly the states the meta backend
 // accepts (see the per-op rules in the file header). The DP prices a
 // candidate with the sum of its inputs' preference ranks (Dist::rank()):

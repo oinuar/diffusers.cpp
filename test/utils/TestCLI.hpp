@@ -59,7 +59,7 @@ public:
             // Set tensor split coefficients.
             meta.tensor_split(tensor_splits);
 
-            return run(backend, compute(weights_context), &runtime);
+            return run({{&weights_context, &backend}}, compute(weights_context), &runtime);
         }
 
         // Use single GPU device.
@@ -67,14 +67,14 @@ public:
             Device gpu(GGML_BACKEND_DEVICE_TYPE_GPU);
             Backend backend(gpu);
 
-            return run(backend, compute(weights_context));
+            return run({{&weights_context, &backend}}, compute(weights_context));
         }
 
         Device cpu(GGML_BACKEND_DEVICE_TYPE_CPU);
         Backend backend(cpu);
 
 
-        return run(backend, compute(weights_context));
+        return run({{&weights_context, &backend}}, compute(weights_context));
     }
 
     virtual Computation<std::vector<Tensor>> compute(Context& weights_context) = 0;
@@ -627,9 +627,9 @@ public:
         mutable std::optional<QuantSpec> quant_spec_;
     };
 public:
-    virtual int run(Backend& backend, Computation<std::vector<Tensor>> computation, ShardingRuntime* sharding = nullptr) {
+    virtual int run(const std::vector<std::pair<Context*, Backend*>>& backends, Computation<std::vector<Tensor>> computation, ShardingRuntime* sharding = nullptr) {
         std::mt19937 rng;
-        auto results = ExecutionRuntime::Default.run(backend, rng, computation, sharding);
+        auto results = ExecutionRuntime::Default.run(backends, rng, computation, sharding);
 
         for (auto& tensor : results) {
             switch (tensor.dtype()) {

@@ -95,8 +95,6 @@ public:
 
     bool use_sharding() const override;
 
-    bool use_host_copy() const override;
-
     const std::vector<TraceNode>& nodes() const { return nodes_; }
     const std::vector<ggml_tensor*>& raw_of() const { return raw_of_; }
 
