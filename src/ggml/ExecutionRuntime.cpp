@@ -7,6 +7,8 @@
 #include "ProgressBar.hpp"
 #include <chrono>
 #include <thread>
+#include <algorithm>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -62,16 +64,11 @@ void ExecutionRuntime::run(
             throw std::runtime_error("run(): the computation's pinned context (weights) has no backend in the backends list");
     }
 
-    // All the state values live on the CPU for the whole run: holding
-    // the state off the scopes' backends is what lets the scopes run on
-    // different backends (a graph may only reference the tensors of its
-    // own buffer, so a state cell a scope's graph reads is bound to a
-    // scope-local input instead -- see bind_state below), and the
-    // values the scopes persist are copied back into the state context
-    // after every execution.
+    // The CPU: the state's device in the host-copy mode (see the mode
+    // decision below), and the fallback device of the scopes that
+    // consume no weights.
     Device cpu(GGML_BACKEND_DEVICE_TYPE_CPU);
     Backend cpu_backend(cpu);
-    const auto state_buft = cpu.buffer_type();
 
     // The state cells: every tensor of the state context.
     std::unordered_set<ggml_tensor*> state_cells;
@@ -151,8 +148,7 @@ void ExecutionRuntime::run(
 
     std::vector<ggml_cgraph*> graphs;
     graphs.reserve(desc.scopes.size());
-    std::vector<Backend*> scope_backends;
-    scope_backends.reserve(desc.scopes.size());
+    std::vector<Backend*> scope_backends(desc.scopes.size());
 
     // The scope that owns each scope-context tensor (the build-phase
     // tensors: the shadows bind_state creates below are owned by the
@@ -166,42 +162,141 @@ void ExecutionRuntime::run(
             scope_owner[t] = i;
     }
 
-    // Derive the backend a scope's graph runs on from what the graph
-    // consumes: a node reading a weight of a pinned context (its src
-    // slots) pins the scope to that context's backend (a view node
-    // views through view_src; the view chain is flattened, so view_src
-    // is always the base tensor); a node reading a tensor of another
+    // Derive the backend a scope's graph runs on from what the scope's
+    // tensor chain consumes: a tensor of a pinned context (a weight)
+    // pins the scope to that context's backend; a tensor of another
     // scope's context (a nested scope referencing its enclosing
-    // scope's chain) pins the scope to the owner's backend -- a graph
-    // may only run on one buffer, and the owner's tensors live in the
-    // owner's. Every consumed pinned / cross-scope tensor resolves to
-    // a single backend -> the scope runs on it. Nothing of either
-    // kind: the scope only moves state values around -> it runs on the
-    // CPU (the state's backend). Several backends: the user must break
-    // the tie by restructuring the computation.
-    auto derive_backend = [&](size_t scope_index, ggml_cgraph* gf) -> Backend* {
-        Backend* scope_backend = nullptr;
+    // scope's chain) pins the scope to the owner's final backend -- a
+    // graph may only reference the tensors of one device, and the
+    // owner's tensors live in the owner's buffer. State cells pin
+    // nothing: in the single-backend mode the state buffer lives on
+    // the same device as every scope's buffer (the graph references
+    // the cell directly), and in the host-copy mode the references are
+    // rewired to scope-local inputs (bind_state).
+    //
+    // A scope that consumes none of the above (one that only moves
+    // state values around) is unconstrained: it runs on the state's
+    // device (the single scope device in the CPY-node mode, the CPU in
+    // the host-copy mode).
+    //
+    // Two passes: the first collects the weight pin of every scope --
+    // the set of pinned devices decides the mode below, which is not
+    // known until every scope has been walked -- the second resolves
+    // every scope's final backend, following the cross-scope
+    // references to the owner's final backend.
+    auto walk = [&](size_t scope_index, auto&& consider) {
+        if (!desc.scopes[scope_index].context)
+            return;
 
-        auto consider = [&](ggml_tensor* t) {
+        for (auto t = ggml_get_first_tensor(**desc.scopes[scope_index].context); t; t = ggml_get_next_tensor(**desc.scopes[scope_index].context, t)) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j)
+                consider(t->src[j]);
+
+            consider(t->view_src);
+        }
+    };
+
+    // The first pass: the weight pin of every scope.
+    std::vector<Backend*> pinned(desc.scopes.size(), nullptr);
+    for (size_t i = 0; i < desc.scopes.size(); ++i) {
+        walk(i, [&](ggml_tensor* t) {
             if (t == nullptr)
                 return;
 
             if (state_cells.count(t))
+                return;   // pins no backend (see above)
+
+            auto it = backend_of_weight.find(t);
+            if (it == backend_of_weight.end())
+                return;   // a scope-local or a cross-scope tensor: resolved in the second pass
+
+            if (pinned[i] != nullptr && pinned[i] != it->second)
                 throw std::runtime_error(
-                    "run(): the scope graph still references the state cell '" +
-                    std::string(ggml_get_name(t)) +
-                    "' -- state binding must have rewired it to a scope-local input");
+                    "run(): a scope's graph consumes weights from several backends -- "
+                    "restructure the computation so the scope's weights live on one backend");
+
+            pinned[i] = it->second;
+        });
+    }
+
+    // The devices the scopes' weights span: a scope's graph runs on
+    // the device of the weights it consumes, so the set is every
+    // distinct device the pinned backends live on (two Backend objects
+    // of one device pin to the same device).
+    std::set<ggml_backend_dev_t> devices;
+    for (auto* backend : pinned)
+        if (backend)
+            devices.insert(*backend->device());
+
+    // The host-copy mode: the saves are copied through host memory
+    // after every execution instead of being written by a CPY node of
+    // the producing scope's graph. A save's destination is a state
+    // cell, and a graph may only write a tensor that lives on its own
+    // device, so the mode is on when the state cannot live on every
+    // scope's device at once:
+    //
+    //  * several devices: the state buffer cannot live on all of them
+    //    -- it stays on the CPU, and the scopes' graphs must not
+    //    reference it (the reads are shadowed, see bind_state);
+    //
+    //  * the single device is an all-CPU meta device: the meta backend
+    //    treats the meta buffer as a host buffer and its graph
+    //    splitter skips a node that is a view of a host buffer -- a
+    //    save CPY node (a view of its destination) would never run.
+    //
+    // Otherwise (a single non-meta-host device) the state buffer lives
+    // on that device: the scopes' graphs read the state cells
+    // directly, and the saves run as CPY nodes of the scopes' graphs
+    // (in place: a CPY node is a view of its destination, so the
+    // write lands in the cell's own storage).
+    const bool host_copy_saves =
+        devices.size() > 1
+        || (!devices.empty()
+            && ggml_backend_dev_type(*devices.begin()) == GGML_BACKEND_DEVICE_TYPE_META
+            && ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(*devices.begin())));
+
+    // The state's device: the scopes' device in the CPY-node mode (the
+    // saves' CPY nodes write the cells in place there), the CPU in the
+    // host-copy mode.
+    const ggml_backend_dev_t state_device = (host_copy_saves || devices.empty()) ? *cpu : *devices.begin();
+    const auto state_buft = ggml_backend_dev_buffer_type(state_device);
+    const Device state_dev(state_device);
+
+    // The backend of the state's device: the fallback for the scopes
+    // that consume no weights (they only move state values around) --
+    // in the CPY-node mode they must run on the state's device (their
+    // graphs reference the state cells), in the host-copy mode on the
+    // CPU.
+    Backend* fallback_backend = &cpu_backend;
+    if (!host_copy_saves && !devices.empty()) {
+        for (auto* backend : pinned)
+            if (backend && *backend->device() == state_device) {
+                fallback_backend = backend;
+                break;
+            }
+    }
+
+    // The second pass: every scope's final backend.
+    for (size_t i = 0; i < desc.scopes.size(); ++i) {
+        auto* scope_backend = pinned[i];
+
+        walk(i, [&](ggml_tensor* t) {
+            if (t == nullptr)
+                return;
+
+            if (state_cells.count(t))
+                return;   // pins nothing (see above)
 
             auto it = backend_of_weight.find(t);
             if (it == backend_of_weight.end()) {
                 // A tensor of another scope's context (a nested scope
                 // referencing its enclosing scope's chain).
                 auto oit = scope_owner.find(t);
-                if (oit == scope_owner.end() || oit->second == scope_index)
+                if (oit == scope_owner.end() || oit->second == i)
                     return;   // a scope-local tensor (a bound input, a state shadow): it lives in the scope's own buffer
 
                 // The owner scope precedes this one in the build order,
-                // so its backend is already derived.
+                // so its backend is already resolved.
                 auto* owner_backend = scope_backends[oit->second];
                 if (scope_backend != nullptr && scope_backend != owner_backend)
                     throw std::runtime_error(
@@ -219,19 +314,45 @@ void ExecutionRuntime::run(
                     "restructure the computation so the scope's weights live on one backend");
 
             scope_backend = it->second;
-        };
+        });
 
-        auto* nodes = ggml_graph_nodes(gf);
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            for (int j = 0; j < GGML_MAX_SRC; ++j)
-                consider(nodes[i]->src[j]);
+        scope_backends[i] = scope_backend != nullptr ? scope_backend : fallback_backend;
+    }
 
-            consider(nodes[i]->view_src);
+    // The host-copy mode: the save CPY nodes cannot run -- a scope's
+    // graph would have to write a state cell off its own device
+    // (several devices) or in a host buffer the meta backend's graph
+    // splitter skips (the all-CPU meta device). Strip the nodes a
+    // previous CPY-node-mode run materialized into the scopes' outputs
+    // (the saves still run, as host-side copies below) and shadow the
+    // state cells the scopes' graphs read.
+    if (host_copy_saves) {
+        for (auto& r : desc.scopes) {
+            // A save CPY node: a CPY op whose destination (the view
+            // source) is a state cell.
+            r.outputs.erase(std::remove_if(r.outputs.begin(), r.outputs.end(), [&](const Tensor& t) {
+                return (*t)->op == GGML_OP_CPY && (*t)->view_src != nullptr && state_cells.count((*t)->view_src);
+            }), r.outputs.end());
+
+            bind_state(r);
         }
 
-        return scope_backend != nullptr ? scope_backend : &cpu_backend;
-    };
+        // Every state reference of a scope's tensor chain must now be a
+        // shadow (a scope-local input): a graph may only reference the
+        // tensors of its own device, and the state cells live off it.
+        for (size_t i = 0; i < desc.scopes.size(); ++i) {
+            walk(i, [&](ggml_tensor* t) {
+                if (t == nullptr)
+                    return;
 
+                if (state_cells.count(t))
+                    throw std::runtime_error(
+                        "run(): the scope graph still references the state cell '" +
+                        std::string(ggml_get_name(t)) +
+                        "' -- state binding must have rewired it to a scope-local input");
+            });
+        }
+    }
 
     if (progress)
         progress->push("Initializing", desc.scopes.size());
@@ -240,24 +361,39 @@ void ExecutionRuntime::run(
     // comes from the context's pool): the body's tensor chain was
     // already recorded there at build time; ggml_build_forward_expand
     // expands it into the graph (the nodes, and the leaves — the
-    // bound inputs of this context and the pre-allocated weights /
-    // state-bound inputs). The graphs must be built BEFORE the buffers
-    // are allocated: the meta backend is brittle about this order.
+    // bound inputs of this context, the pre-allocated weights, and the
+    // state cells the graph references directly in the CPY-node mode /
+    // the state-bound inputs in the host-copy mode). The graphs must be
+    // built BEFORE the buffers are allocated: the meta backend is
+    // brittle about this order.
     for (size_t i = 0; i < desc.scopes.size(); ++i) {
         auto& r = desc.scopes[i];
-        // The state cells the scope's graph reads are bound to
-        // scope-local inputs before the graph is built, so the shadows
-        // are the graph's leaves, not the state cells.
-        bind_state(r);
 
         auto* gf = ggml_new_graph_custom(**r.context, r.context->capacity(), /*grads=*/false);
+
+        // The saves, in the CPY-node mode: materialized as CPY nodes of
+        // the scope's graph -- a node is a view of its destination
+        // (the state cell), so the execution writes the value into the
+        // cell in place, in the cell's own storage in the state buffer
+        // (on the scope's own device in this mode). A node is created
+        // once (appended to the scope's outputs) and re-used on every
+        // re-run.
+        if (!host_copy_saves)
+            for (const auto& save : r.saves) {
+                bool have_cpy = false;
+                for (const auto& out : r.outputs)
+                    if ((*out)->op == GGML_OP_CPY && (*out)->src[0] == *save.src && (*out)->view_src == *save.dst)
+                        have_cpy = true;
+
+                if (!have_cpy)
+                    r.outputs.push_back(Tensor(ggml_cpy(**r.context, *save.src, *save.dst)));
+            }
 
         // Build graph for every output Tensor.
         for (const auto& out : r.outputs)
             ggml_build_forward_expand(gf, *out);
 
         graphs.push_back(gf);
-        scope_backends.push_back(derive_backend(i, gf));
 
         if (progress)
             progress->next();
@@ -315,13 +451,18 @@ void ExecutionRuntime::run(
         print_buffer(backend->device(), ctx->allocated_size(), " (weights)");
     }
 
-    // Allocate the state context on the CPU: it stays resident for the
-    // whole run -- and every later run -- it carries every value the
-    // computation dereferenced (the state cells they were materialized
-    // into), and the caller reads the computation's final value from it.
+    // Allocate the state context: it stays resident for the whole run
+    // -- and every later run -- it carries every value the computation
+    // dereferenced (the state cells they were materialized into), and
+    // the caller reads the computation's final value from it.
+    //
+    // The device: the scopes' own device in the CPY-node mode (the
+    // saves' CPY nodes write the cells in place, in the cells' own
+    // storage), the CPU in the host-copy mode (see the decision
+    // above).
     if (desc.state) {
         desc.state->allocate(state_buft, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-        print_buffer(cpu, desc.state->allocated_size(), " (state)");
+        print_buffer(state_dev, desc.state->allocated_size(), " (state)");
     }
 
     if (progress)
@@ -427,9 +568,11 @@ void ExecutionRuntime::run(
             // The graph is a single allocation with multiple computations:
             // compute the SAME graph repeatedly. The loop state is carried
             // by the saves: the body's output is written back into the
-            // loop's state cell on every execution, with a host-side copy
-            // after the execution (the state lives on the CPU, the graph's
-            // output on the scope's backend).
+            // loop's state cell on every execution -- by a CPY node of
+            // the graph (in place: the CPY node is a view of the cell,
+            // so the write lands in the cell's own storage in the state
+            // buffer), or by a host-side copy after the execution when
+            // the runtime cannot run the node (host_copy_saves).
 
             for (r.repeat->iter = 0; r.repeat->iter < r.repeat->count; ++r.repeat->iter) {
                 // The re-bindable inputs: rewritten on every (re-)execution.
@@ -443,11 +586,13 @@ void ExecutionRuntime::run(
                 if (ggml_backend_graph_compute(*scope_backend, gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("run(): ggml_backend_graph_compute failed");
 
-                // The loop state: written back into the state cell on
-                // every execution.
-                for (const auto& save : r.saves)
-                    if (save.is_feedback)
-                        copy(save.src, save.dst);
+                // The loop state, when the runtime cannot run the save
+                // CPY node (host_copy_saves): written back into the
+                // state cell on every execution.
+                if (host_copy_saves)
+                    for (const auto& save : r.saves)
+                        if (save.is_feedback)
+                            copy(save.src, save.dst);
 
                 if (progress)
                     progress->next();
@@ -477,11 +622,13 @@ void ExecutionRuntime::run(
                 progress->pop();
         }
 
-        // The values the scope persists: written back into the state
-        // context (on the CPU) after the execution.
-        for (const auto& save : r.saves)
-            if (!save.is_feedback)
-                copy(save.src, save.dst);
+        // The values the scope persists, when the runtime cannot run
+        // the save CPY node (host_copy_saves): written back into the
+        // state context after the execution.
+        if (host_copy_saves)
+            for (const auto& save : r.saves)
+                if (!save.is_feedback)
+                    copy(save.src, save.dst);
 
         // The scope is done: free its buffer. Nothing in the scope
         // context leaks outside -- the values that survive are in the
@@ -522,10 +669,10 @@ void ExecutionRuntime::bind(std::mt19937& rng, Context& context, bool once_only,
 
 void ExecutionRuntime::copy(const Tensor& src, const Tensor& dst) const {
     // A value a scope persists (a save) or the loop state of a repeat
-    // scope (a feedback save) is written back into the state context
-    // after the scope's execution: the value is read from the source
-    // tensor (in the scope's buffer, on the scope's backend) and
-    // written into the state cell (on the CPU).
+    // scope (a feedback save), in the host-copy mode: the value is
+    // read from the source tensor (in the scope's buffer, on the
+    // scope's backend) and written into the state cell (on the CPU --
+    // the state's device in the host-copy mode).
     size_t nbytes = ggml_nbytes(*src);
     std::vector<std::byte> data(nbytes);
     ggml_backend_tensor_get(*src, data.data(), 0, nbytes);

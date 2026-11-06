@@ -17,22 +17,29 @@ public:
     //
     // backends maps every pinned (weights) context to the backend the
     // weights are loaded on. Each scope's graph runs on the backend of
-    // the weights it consumes: a scope whose graph leaves (directly, or
-    // through a view) all live in the pinned contexts of a single
-    // backend runs on that backend; a scope with no pinned leaves (one
-    // that only moves state values around) runs on the CPU; a scope
-    // whose leaves span several backends is an error -- the user must
-    // restructure the computation so every scope's weights live on one
+    // the weights it consumes: a scope whose graph references (directly,
+    // or through a view) the tensors of a single backend runs on that
+    // backend; a scope with no pinned references (one that only moves
+    // state values around) runs on the state's device; a scope whose
+    // references span several backends is an error -- the user must
+    // restructure the computation so every scope's tensors live on one
     // backend.
     //
-    // All the state values live on the CPU for the whole run: the state
-    // context is allocated on the CPU, a state cell a scope's graph
-    // reads is bound to a scope-local input of the scope context (the
-    // binding copies the cell's current value before every execution of
-    // the scope), and the values the scopes persist (the saves) are
-    // copied back into the state context after every execution. Since
-    // no state tensor crosses a scope boundary inside a graph, the
-    // scopes may run on different backends.
+    // The state's device follows the scopes' backends: when every
+    // scope's graph runs on one device, the state context is allocated
+    // on that device, the scopes' graphs read the state cells directly,
+    // and the values the scopes persist (the saves) are written by a
+    // CPY node of the producing scope's graph (in place: the CPY node
+    // is a view of the state cell). When the scopes run on several
+    // devices -- or on the one device that cannot run such a node, an
+    // all-CPU meta device (the meta backend treats the meta buffer as a
+    // host buffer and its graph splitter skips a node that is a view of
+    // a host buffer) -- the state context is allocated on the CPU
+    // instead: a state cell a scope's graph reads is bound to a
+    // scope-local input of the scope context (the binding copies the
+    // cell's current value before every execution of the scope), the
+    // save CPY nodes are dropped from the graphs, and the saves are
+    // copied back through host memory after every execution.
     //
     // Memory management is part of the execution: the pinned (weights)
     // contexts and the state context are allocated once, on the first

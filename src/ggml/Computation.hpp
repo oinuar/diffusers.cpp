@@ -24,13 +24,15 @@
 // the ones the computation dereferences (operator*): each is materialized
 // into a persistent cell in the state context, and the producing scope
 // writes it there after every execution (a save).
-
+//
 // One value crossing a scope boundary: the value (in the producing
 // scope's context) is written into the persistent destination (a state
-// cell) with a host-side copy after every execution of the producing
-// scope. The state context lives on the CPU (see ExecutionRuntime::run),
-// so the scopes may run on different backends: no state tensor crosses a
-// scope boundary inside a graph.
+// cell). The save is a requirement of the computation description: the
+// ExecutionRuntime materializes it -- as a CPY node of the producing
+// scope's graph (the node is a view of the cell, so the write happens in
+// the cell's own storage, in place, on the scope's backend), or as a
+// host-side copy after every execution of the producing scope (when the
+// scope backends do not allow the CPY node: see ExecutionRuntime::run).
 
 struct ComputationScope {
     struct Repeat {
@@ -492,6 +494,9 @@ public:
         
         r.outputs = next_values;
 
+        // The feedback saves: requirements the ExecutionRuntime
+        // materializes (a CPY node of this graph in place, or a host-side
+        // copy after every execution -- see ExecutionRuntime::run).
         for (auto i = 0; i < next_values.size(); ++i)
             r.saves.push_back({
                 next_values[i], // src
@@ -520,9 +525,12 @@ private:
     // persistent cell. The cell is allocated in the state context (the
     // temporarily active context; the active runtime is kept, so a
     // sharding runtime still traces the cell), and a save is registered
-    // in the producing scope: a host-side copy writes the value into
-    // the cell after every execution of the scope (the state context
-    // lives on the CPU, see ExecutionRuntime::run). Every
+    // in the producing scope: a requirement the ExecutionRuntime
+    // materializes as a CPY node of the scope's graph (the node is a
+    // view of the cell, so the write happens in the cell's own storage,
+    // in place), or as a host-side copy after every execution of the
+    // scope when the CPY node cannot run (see ExecutionRuntime::run).
+    // Every
     // materialization of the same value returns the same cell (the
     // Description deduplicates), and a value that already lives in a
     // persistent context (the state or a pinned context) is returned
@@ -543,6 +551,10 @@ private:
         Scope state_scope(desc_->context());
         auto cell = ComputationValue<Tensor>::state(value).name(value.name() + std::string(" (state)"));
 
+        // The save: a requirement the ExecutionRuntime materializes
+        // (a CPY node of the producing scope's graph in place, or a
+        // host-side copy after every execution of it -- see
+        // ExecutionRuntime::run).
         scope->saves.push_back({
             value, // src
             cell, // dst
